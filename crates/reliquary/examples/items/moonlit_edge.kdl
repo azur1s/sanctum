@@ -1,0 +1,22 @@
+// Reliquary item file (KDL v2). A file can hold any number of `item` nodes.
+// Put `/-` in front of a line or block to switch it off.
+
+item "moonlit_edge" {
+    name "Moonlit Edge"
+    kind "Sword"
+    base "minecraft:diamond_sword"
+    rarity "epic"
+    // One socket for red gems, one for any gem. See gems.kdl.
+    sockets "red" "any"
+    lore "Forged under a silver moon."
+
+    stats {
+        damage       12
+        attack-speed 1.6
+    }
+
+    // Skills from the library (skills/*.kdl), with this item's numbers.
+    skill "moon_slash"
+    skill "moon_bolt"
+    skill "lunar_mark" chance=0.3 seconds=4
+}

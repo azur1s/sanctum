@@ -1,0 +1,36 @@
+// Item rarities. Items pick one with `rarity "<id>"`; items without one get
+// the first rarity in this file.
+//
+// name  Shown in the lore, before the item's kind: "Epic Sword".
+// color Color codes put before the item name, the lore's rarity line and
+//       skill bullets, like "&5" (or several, like "&6&l").
+
+rarity "common" {
+    name "Common"
+    color "&f"
+}
+
+rarity "uncommon" {
+    name "Uncommon"
+    color "&a"
+}
+
+rarity "rare" {
+    name "Rare"
+    color "&9"
+}
+
+rarity "epic" {
+    name "Epic"
+    color "&5"
+}
+
+rarity "legendary" {
+    name "Legendary"
+    color "&6"
+}
+
+rarity "mythic" {
+    name "Mythic"
+    color "&d"
+}

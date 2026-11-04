@@ -1,0 +1,66 @@
+// How stats look in item lore. Stats show in the order listed here; any
+// stat not listed comes after them, by name, with the default `format`.
+//
+// format  The line. {name} is the stat's name, {value} its amount and
+//         {sign} a "+" for amounts of 0 or more (negative ones already
+//         have their "-"). The top-level one is the default for every stat.
+// name    The stat's name in the lore. Defaults to the stat in title case,
+//         like "Magic Power".
+// hidden  #true leaves the stat out of the lore. It still counts.
+
+format "&7{name} &b{sign}{value}"
+
+// Damage and attack speed are the item's totals, not bonuses: no sign.
+stat "damage" {
+    name "Damage"
+    format "&7{name} &c{value}"
+}
+
+stat "attack-speed" {
+    name "Attack Speed"
+    format "&7{name} &e{value}"
+}
+
+stat "health" {
+    name "Health"
+    format "&7{name} &c{sign}{value}"
+}
+
+stat "armor" {
+    name "Armor"
+    format "&7{name} &a{sign}{value}"
+}
+
+stat "armor-toughness" {
+    name "Armor Toughness"
+    format "&7{name} &a{sign}{value}"
+}
+
+// Percent: `speed 10` is 10% faster.
+stat "speed" {
+    name "Speed"
+    format "&7{name} &f{sign}{value}%"
+}
+
+stat "strength" {
+    name "Strength"
+    format "&7{name} &c{sign}{value}"
+}
+
+stat "magic-power" {
+    name "Magic Power"
+    format "&7{name} &d{sign}{value}"
+}
+
+stat "magic-armor" {
+    name "Magic Armor"
+    format "&7{name} &d{sign}{value}"
+}
+
+stat "max-mana" {
+    name "Max Mana"
+}
+
+stat "mana-regen" {
+    name "Mana Regen"
+}

@@ -1,0 +1,66 @@
+// Skills for the Starweave armor set. Armor and offhand items can use every
+// trigger except clicks and melee hits (those come from the main hand):
+//   damaged, kill, sneak, timer every="5s", equip, unequip
+
+skill "starlight_ward" {
+    name "Starlight Ward"
+    description "When hit, heal and throw the attacker back."
+    trigger "damaged"
+    cooldown 6.0
+
+    heal 2
+    target "ring" radius=1 points=12 height=1 {
+        particle "end_rod" count=1 spread=0
+    }
+    target "attacker" {
+        knockback 1.0 up=0.4
+        particle "enchanted_hit" count=10 spread=0.3
+    }
+}
+
+skill "starstep" {
+    name "Starstep"
+    description "Sneak to blink a few blocks forward."
+    trigger "sneak"
+    cost mana=15
+    cooldown 4.0
+
+    param distance 6
+
+    particle "portal" count=30 spread=0.4
+    blink $distance
+    particle "reverse_portal" count=30 spread=0.4
+    sound "entity.enderman.teleport" pitch=1.5
+}
+
+skill "stardust" {
+    name "Stardust"
+    description "Every few seconds, a little healing light falls on you."
+    trigger "timer" every="5s"
+
+    heal 1
+    particle "wax_off" count=8 spread=0.5
+}
+
+skill "harvest" {
+    name "Harvest"
+    description "Kills fill you with starlight."
+    trigger "kill"
+
+    heal 3
+    target "victim" {
+        particle "totem_of_undying" count=20 spread=0.4 speed=0.2
+    }
+    sound "block.amethyst_block.resonate" pitch=1.4
+}
+
+skill "attune" {
+    name "Attune"
+    description "Glows when equipped."
+    trigger "equip"
+
+    message "&dThe moonstone hums in your hand."
+    target "ring" radius=0.8 points=16 height=1 {
+        particle "end_rod" count=1 spread=0
+    }
+}

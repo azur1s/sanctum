@@ -1,0 +1,16 @@
+item "stormcaller" {
+    name "Stormcaller"
+    kind "Staff"
+    base "minecraft:blaze_rod"
+    rarity "legendary"
+    lore "Hums before every storm."
+    lore "The air tastes of copper."
+
+    stats {
+        damage     6
+        mana-regen 2
+    }
+
+    skill "thunderstrike" mana=35 damage=14
+    skill "overcharge"
+}

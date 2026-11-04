@@ -1,0 +1,74 @@
+// Skill library (KDL v2). Each `skill` can be used by any item:
+//     skill "moon_slash" mana=25 damage=8
+// Items may override `mana`, `cooldown`, `chance`, `name` and any `param`.
+// Use a param anywhere a number goes, as `$name`.
+
+skill "moon_slash" {
+    name "Moon Slash"
+    description "Cut a crescent of moonlight in front of you."
+    trigger "right_click"
+    cost mana=20
+    cooldown 3.0
+
+    param damage 6
+    param reach 4
+    param width 100
+
+    sound "entity.player.attack.sweep" pitch=1.4
+
+    // The crescent: points on an arc, a little light on each.
+    target "arc" radius=2.5 angle=$width points=11 height=1.3 {
+        particle "end_rod" count=2 spread=0.03 speed=0.01
+    }
+    target "forward" distance=2 height=1.3 {
+        particle "sweep_attack" count=1 spread=0
+    }
+
+    // Everything in front of you gets hit.
+    target "cone" range=$reach angle=$width {
+        damage $damage kind="magic" scale=0.2
+        knockback 0.6 up=0.25
+    }
+}
+
+skill "moon_bolt" {
+    name "Moon Bolt"
+    description "Throw a bolt of moonlight that bursts on the first thing it touches."
+    trigger "left_click"
+    cost mana=10
+    cooldown 1.5
+
+    param damage 5
+
+    sound "entity.illusioner.cast_spell" pitch=1.6
+    projectile speed=1.2 range=24 radius=0.7 {
+        trail {
+            particle "end_rod" count=1 spread=0
+        }
+        hit {
+            // Counts as a hit, so Lunar Mark can proc from it.
+            damage $damage kind="magic" scale=0.2 triggers-hit=#true
+            particle "end_rod" count=15 spread=0.2 speed=0.1
+            sound "block.amethyst_cluster.break" pitch=1.4
+        }
+        end {
+            particle "end_rod" count=12 spread=0.2 speed=0.05
+        }
+    }
+}
+
+skill "lunar_mark" {
+    name "Lunar Mark"
+    description "Hits may mark the target with moonlight."
+    trigger "hit"
+    chance 0.3
+
+    param seconds 3
+
+    target "victim" {
+        when "!player"
+        glow $seconds
+        particle "end_rod" count=15 spread=0.4 speed=0.02
+        sound "block.amethyst_block.chime" pitch=1.5
+    }
+}

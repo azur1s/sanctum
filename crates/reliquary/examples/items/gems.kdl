@@ -1,0 +1,69 @@
+// Gems. A gem is an item with a `gem "<type>"` line, so it has the usual name,
+// base, rarity, lore, stats and skills, and `/relic give` hands it out.
+//
+// It does nothing on its own. Socketed, its stats and skills join the item:
+//     /relic socket     puts the gem in your offhand into the main-hand item
+//     /relic unsocket   takes one back out
+//
+// Items declare their sockets:
+//     sockets 2                two sockets that take any gem
+//     sockets "red" "any"      one for red gems, one for any gem
+//
+// A "red" gem fits "red" and "any" sockets; an "any" gem fits every socket.
+// A gem won't go in an item its stats or skills can't work on: `damage` and
+// `attack-speed` need a main-hand item with that stat, and click and hit
+// skills need a main-hand item.
+
+item "ruby" {
+    name "Ruby"
+    kind "Gem"
+    base "minecraft:redstone"
+    rarity "rare"
+    gem "red"
+    lore "Warm to the touch."
+
+    stats {
+        strength 8
+        health   2
+    }
+}
+
+item "sapphire" {
+    name "Sapphire"
+    kind "Gem"
+    base "minecraft:lapis_lazuli"
+    rarity "rare"
+    gem "blue"
+    lore "Clear as deep water."
+
+    stats {
+        magic-power 10
+        mana-regen  1
+    }
+}
+
+item "stormglass" {
+    name "Stormglass"
+    kind "Gem"
+    base "minecraft:prismarine_crystals"
+    rarity "epic"
+    gem "any"
+    lore "Something flickers inside."
+
+    stats {
+        max-mana 15
+    }
+
+    // Skills from gems run like the item's own. The cooldown belongs to the gem.
+    skill "Static" {
+        description "Hits may shock the target."
+        trigger "hit"
+        chance 0.2
+        cooldown 2.0
+
+        target "victim" {
+            damage 3 kind="magic" scale=0.1
+            particle "electric_spark" count=10 spread=0.3
+        }
+    }
+}

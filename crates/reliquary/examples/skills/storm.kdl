@@ -1,0 +1,68 @@
+skill "thunderstrike" {
+    name "Thunderstrike"
+    description "Call lightning on the creature you look at, dealing &5<$damage + self.magic_power * 0.25> &7damage."
+    trigger "right_click"
+    when "!sneaking"
+    cost mana=35
+    cooldown 8.0
+
+    param damage 10
+    param splash 4
+    param range 20
+
+    // A beam from your eyes, then the strike.
+    target "line" range=$range step=0.6 {
+        particle "electric_spark" count=1 spread=0
+    }
+    target "ray" range=$range required=#true {
+        lightning effect-only=#true
+        damage $damage kind="magic" scale=0.25 source="lightning_bolt"
+        ignite 2
+        wait "0.5s"
+        target "ring" radius=2 points=20 {
+            particle "electric_spark" count=2 spread=0.1
+        }
+        // Arcs to 3 more creatures nearby.
+        chain jumps=4 radius=5 delay=4 beam="electric_spark" {
+            damage $splash kind="magic" source="lightning_bolt"
+        }
+    }
+    on-fail {
+        message "&7No target in sight."
+    }
+}
+
+skill "overcharge" {
+    name "Overcharge"
+    description "Charge up, then blast everything around you for &5<$damage + self.magic_power * 0.5> &7damage."
+    trigger "right_click"
+    when "sneaking"
+    cost mana=60
+    cooldown 30.0
+
+    param damage 15
+    param radius 6
+
+    // Three shrinking rings while charging.
+    repeat 3 every=10 {
+        target "ring" radius=2 points=24 height=0.2 {
+            particle "electric_spark" count=1 spread=0
+        }
+        sound "block.beacon.power_select" pitch=1.6
+    }
+    wait 30
+    target "radius" range=$radius {
+        pull 0.8
+    }
+    wait 5
+    target "ring" radius=$radius points=48 height=0.5 {
+        particle "explosion" count=1 spread=0
+    }
+    target "radius" range=$radius {
+        damage $damage kind="magic" scale=0.5
+        knockback 1.2 up=0.8
+    }
+    sound "entity.generic.explode" volume=0.6 pitch=1.4
+    heal 4
+    effect "speed" seconds=5 level=2
+}

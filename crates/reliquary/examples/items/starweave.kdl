@@ -1,0 +1,91 @@
+// A caster armor set. Armor gives stats while worn; the slot comes from the
+// base item (`*_helmet` -> head, ...), or set it with `slot "offhand"` etc.
+//
+// Stats the plugin knows:
+//   max-mana, mana-regen            plugin mana
+//   health, armor, armor-toughness  vanilla attributes (shown by the vanilla tooltip)
+//   speed                           percent, `speed 10` = 10% faster
+//   damage, attack-speed            main-hand items only
+// Any other stat is custom. Damage kind stats (magic-power, strength) come
+// from kinds.kdl; declare any others once, in any file, with `stat "name"`.
+// Custom stats add up across items, and formulas read them as `self.magic_power`.
+
+item "starweave_hood" {
+    name "Starweave Hood"
+    kind "Helmet"
+    base "minecraft:chainmail_helmet"
+    rarity "rare"
+    lore "Threads spun from falling stars."
+
+    stats {
+        magic-power 10
+        max-mana    20
+        magic-armor 10
+    }
+
+    skill "stardust"
+}
+
+item "starweave_robe" {
+    name "Starweave Robe"
+    kind "Chestplate"
+    base "minecraft:chainmail_chestplate"
+    rarity "rare"
+    sockets 1
+    lore "Hums faintly when you cast."
+
+    stats {
+        magic-power 20
+        max-mana    30
+        magic-armor 25
+        health      4
+    }
+
+    skill "starlight_ward"
+}
+
+item "starweave_leggings" {
+    name "Starweave Leggings"
+    kind "Leggings"
+    base "minecraft:chainmail_leggings"
+    rarity "rare"
+
+    stats {
+        magic-power 15
+        mana-regen  2
+    }
+
+    skill "harvest"
+}
+
+item "starweave_boots" {
+    name "Starweave Boots"
+    kind "Boots"
+    base "minecraft:chainmail_boots"
+    rarity "rare"
+    lore "Light as starlight."
+
+    stats {
+        magic-power 5
+        speed       10
+    }
+
+    skill "starstep"
+}
+
+item "moonstone_charm" {
+    name "Moonstone Charm"
+    kind "Charm"
+    base "minecraft:amethyst_shard"
+    slot "offhand"
+    rarity "epic"
+    // Placeholders use the stats of whoever holds the item.
+    lore "Your magic power: <self.magic_power>"
+
+    stats {
+        magic-power 15
+        max-mana    25
+    }
+
+    skill "attune"
+}

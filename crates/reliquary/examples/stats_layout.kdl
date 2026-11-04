@@ -1,0 +1,24 @@
+// What item lore shows, top to bottom. Move a line to move what it shows.
+// Anything left out, or switched off with `/-`, is not shown.
+// The item's name always stays on top of the tooltip.
+//
+// rarity  The rarity and kind, like "Epic Sword".
+// lore    The item's `lore` text.
+// stat    One stat, like `stat "damage"`, if the item has it. Its look is in
+//         stats_format.kdl.
+// stats   Every stat not placed with `stat`, in stats_format.kdl's order.
+//         Includes what reforges and gems add.
+// sockets The item's sockets and the gems in them.
+// skills  The item's skills, in the order the item lists them.
+// empty   A blank line. Dropped when what it separates is missing from an
+//         item, so an item without lore does not get two in a row.
+
+rarity
+empty
+lore
+empty
+stats
+empty
+sockets
+empty
+skills

@@ -1,0 +1,48 @@
+// Reforges. `/relic reforge` rolls one onto the item in your main hand, and
+// its stats add to the item's. A new roll replaces the old one and never lands
+// on the same reforge if another one fits.
+//
+// name    Put before the item's name: "Sharp Moonlit Edge".
+// weight  How often a roll lands here, relative to the rest. Defaults to 1.
+// slots   Only items in these slots (mainhand, offhand, head, chest, legs, feet).
+// kinds   Only items of these `kind`s, ignoring case.
+// stats   What it adds. `damage` and `attack-speed` only reach main-hand items
+//         that already have that stat, since those two are the item's totals.
+//
+// Items opt out with `reforgeable #false`. Stacks hold only the reforge's id,
+// so editing a reforge changes every item that has it.
+
+reforge "sharp" {
+    name "Sharp"
+    weight 3
+    kinds "Sword"
+    stats {
+        damage 2
+    }
+}
+
+reforge "swift" {
+    name "Swift"
+    weight 2
+    stats {
+        speed 5
+    }
+}
+
+reforge "attuned" {
+    name "Attuned"
+    weight 2
+    stats {
+        magic-power 8
+        max-mana    10
+    }
+}
+
+reforge "warding" {
+    name "Warding"
+    slots "head" "chest" "legs" "feet"
+    stats {
+        magic-armor 10
+        health      2
+    }
+}

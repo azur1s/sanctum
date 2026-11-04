@@ -1,0 +1,39 @@
+// Damage kinds. Skills pick one with `damage <amount> kind="..." scale=...`:
+//
+//     damage 10 kind="magic" scale=0.25    // 10 + magic power × 0.25
+//
+// power   The stat that scales this kind. It counts as declared, so items
+//         can use it in `stats { }` and formulas as `self.<stat>` without a
+//         separate `stat "..."` line.
+// defense The target's stat that reduces this kind: damage × 100 / (100 + defense),
+//         so 100 defense halves it. Also counts as declared. Only players have
+//         stats, so mobs have 0.
+// source  The Minecraft damage type used for the hit: decides vanilla armor,
+//         death messages and so on. A `damage` line can override it with `source=`.
+//         Damage that is not from a skill (melee, ...) counts as the kind
+//         whose source matches, for damage numbers.
+// display How damage numbers of this kind look: `prefix` goes before the
+//         number (an icon from a resource pack font works too), `color` is
+//         the number's color codes.
+//
+// Physical has no `defense`: vanilla armor already reduces `player_attack`
+// damage, and a defense stat on top would count armor twice.
+
+kind "physical" {
+    power "strength"
+    source "player_attack" // armor applies
+    display {
+        prefix "⚔ "
+        color "&c"
+    }
+}
+
+kind "magic" {
+    power "magic-power"
+    defense "magic-armor"
+    source "magic" // vanilla magic: ignores vanilla armor
+    display {
+        prefix "✦ "
+        color "&d"
+    }
+}

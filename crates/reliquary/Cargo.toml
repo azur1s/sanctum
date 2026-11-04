@@ -1,0 +1,14 @@
+[package]
+name = "reliquary"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+kdl = { version = "6.7.1", default-features = false, features = ["span"] }
+pumpkin-plugin-api.workspace = true
+serde.workspace = true
+toml.workspace = true
+tracing.workspace = true

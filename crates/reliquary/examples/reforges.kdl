@@ -42,7 +42,7 @@ reforge "warding" {
     name "Warding"
     slots "head" "chest" "legs" "feet"
     stats {
-        magic-armor 10
+        magic-defense 10
         health      2
     }
 }

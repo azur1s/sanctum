@@ -15,6 +15,7 @@ use pumpkin_plugin_api::{
     command_wit::Arg,
     commands::{CommandHandler, CommandSuggestionHandler},
     common::Hand,
+    world::EquipmentSlot,
     data_components::DataComponent,
     events::{
         EntityDamageByEntityEvent, EventData, EventHandler, EventPriority, InteractAction,
@@ -28,18 +29,21 @@ use pumpkin_plugin_api::{
 use tracing::{info, warn};
 
 use crate::engine::{self, Cast, text};
-use crate::items::{self, DamageKind, Instance, ItemDef, Params, PlayerStats, ReforgeDef, Reforges, Scope, Slot, StatFormats, Trigger, forge};
+use crate::items::{self, DamageKind, Elements, Instance, ItemDef, Params, PlayerStats, ReforgeDef, Reforges, Scope, Slot, StatFormats, Trigger, UpgradeDef, Upgrades, forge};
 use crate::{mana, stats};
 
 pub(crate) const NS: &str = "reliquary";
 const PERMISSION: &str = "reliquary:command.relic";
+/// How far `/relic equip` reaches, in blocks.
+const EQUIP_RANGE: f64 = 20.0;
 
 /// Written to `items/` and `skills/` when those folders do not exist yet.
-const EXAMPLES: [(&str, &str); 7] = [
+const EXAMPLES: [(&str, &str); 8] = [
     ("items/moonlit_edge.kdl", include_str!("../examples/items/moonlit_edge.kdl")),
     ("items/stormcaller.kdl", include_str!("../examples/items/stormcaller.kdl")),
     ("items/starweave.kdl", include_str!("../examples/items/starweave.kdl")),
     ("items/gems.kdl", include_str!("../examples/items/gems.kdl")),
+    ("items/upgrades.kdl", include_str!("../examples/items/upgrades.kdl")),
     ("skills/blades.kdl", include_str!("../examples/skills/blades.kdl")),
     ("skills/storm.kdl", include_str!("../examples/skills/storm.kdl")),
     ("skills/starweave.kdl", include_str!("../examples/skills/starweave.kdl")),
@@ -47,6 +51,9 @@ const EXAMPLES: [(&str, &str); 7] = [
 
 /// Written to `kinds.kdl` when it does not exist yet.
 const KINDS_EXAMPLE: &str = include_str!("../examples/kinds.kdl");
+
+/// Written to `elements.kdl` when it does not exist yet.
+const ELEMENTS_EXAMPLE: &str = include_str!("../examples/elements.kdl");
 
 /// Written to `item_rarity.kdl` when it does not exist yet.
 const RARITY_EXAMPLE: &str = include_str!("../examples/item_rarity.kdl");
@@ -60,9 +67,15 @@ const STATS_LAYOUT_EXAMPLE: &str = include_str!("../examples/stats_layout.kdl");
 /// Written to `reforges.kdl` when it does not exist yet.
 const REFORGES_EXAMPLE: &str = include_str!("../examples/reforges.kdl");
 
+/// Written to `upgrades.kdl` when it does not exist yet.
+const UPGRADES_EXAMPLE: &str = include_str!("../examples/upgrades.kdl");
+
 static ITEMS: RwLock<BTreeMap<String, Arc<ItemDef>>> = RwLock::new(BTreeMap::new());
 static REFORGES: RwLock<Reforges> = RwLock::new(BTreeMap::new());
+static UPGRADES: RwLock<Upgrades> = RwLock::new(BTreeMap::new());
 static KINDS: RwLock<BTreeMap<String, DamageKind>> = RwLock::new(BTreeMap::new());
+/// None until the first successful load.
+static ELEMENTS: RwLock<Option<Arc<Elements>>> = RwLock::new(None);
 /// None until the first successful load.
 static STAT_FORMATS: RwLock<Option<Arc<StatFormats>>> = RwLock::new(None);
 static DATA_FOLDER: OnceLock<String> = OnceLock::new();
@@ -121,6 +134,7 @@ pub fn load_items() -> Result<usize, Vec<String>> {
     let mut library = BTreeMap::new();
     let mut stat_refs = Vec::new();
     let mut kind_refs = Vec::new();
+    let mut element_refs = Vec::new();
     let mut declared = std::collections::BTreeSet::new();
     let mut problems = Vec::new();
 
@@ -146,6 +160,23 @@ pub fn load_items() -> Result<usize, Vec<String>> {
             problems.push(format!("kinds.kdl: kind `{}` has unknown source `{}`", kind.id, kind.source));
         }
     }
+    // Elements, and the stats that can be tagged with one.
+    let elements_path = root.join("elements.kdl");
+    if !elements_path.exists() {
+        std::fs::write(&elements_path, ELEMENTS_EXAMPLE).map_err(|e| vec![format!("elements.kdl: {e}")])?;
+    }
+    let elements = match std::fs::read_to_string(&elements_path)
+        .map_err(|e| format!("elements.kdl: {e}"))
+        .and_then(|src| items::parse_elements("elements.kdl", &src).map_err(|e| e.to_string()))
+    {
+        Ok(elements) => elements,
+        Err(e) => {
+            problems.push(e);
+            Elements::default()
+        }
+    };
+    let mut taggable: std::collections::BTreeSet<String> = ["damage", "defense"].map(String::from).into();
+    taggable.extend(kinds.values().flat_map(|k| k.power.iter().chain(&k.defense)).cloned());
     // Rarities too, in file order (the first is the default).
     let rarity_path = root.join("item_rarity.kdl");
     if !rarity_path.exists() {
@@ -207,6 +238,21 @@ pub fn load_items() -> Result<usize, Vec<String>> {
         }
     };
     let reforges: Reforges = reforges.into_iter().map(|r| (r.id.clone(), Arc::new(r))).collect();
+    // Upgrades.
+    let upgrades_path = root.join("upgrades.kdl");
+    if !upgrades_path.exists() {
+        std::fs::write(&upgrades_path, UPGRADES_EXAMPLE).map_err(|e| vec![format!("upgrades.kdl: {e}")])?;
+    }
+    let (upgrades, upgrade_stats, upgrade_inherited) = match std::fs::read_to_string(&upgrades_path)
+        .map_err(|e| format!("upgrades.kdl: {e}"))
+        .and_then(|src| items::parse_upgrades("upgrades.kdl", &src).map_err(|e| e.to_string()))
+    {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            problems.push(e);
+            Default::default()
+        }
+    };
     for path in files {
         let shown = path.strip_prefix(root).unwrap_or(&path).display().to_string().replace('\\', "/");
         let parsed = std::fs::read_to_string(&path)
@@ -224,6 +270,7 @@ pub fn load_items() -> Result<usize, Vec<String>> {
                 item_files.extend(parsed.items);
                 stat_refs.extend(parsed.stat_refs);
                 kind_refs.extend(parsed.kind_refs);
+                element_refs.extend(parsed.element_refs);
                 declared.extend(parsed.declared_stats);
             }
             Err(e) => problems.push(e),
@@ -231,10 +278,16 @@ pub fn load_items() -> Result<usize, Vec<String>> {
     }
 
     problems.extend(items::check_stat_names(&reforge_stats, &declared));
+    problems.extend(items::check_stat_elements(&reforge_stats, &taggable, &elements));
+    problems.extend(items::check_stat_names(&upgrade_stats, &declared));
+    problems.extend(items::check_stat_names(&upgrade_inherited, &declared));
+    problems.extend(items::check_stat_elements(&upgrade_stats, &taggable, &elements));
+    problems.extend(items::check_inherited_stats(&upgrade_inherited, &taggable));
 
     let mut set = BTreeMap::new();
     for file in item_files {
         problems.extend(items::check_stats(&file, &declared));
+        problems.extend(items::check_stat_elements(&file.stat_at, &taggable, &elements));
         // Inline skills are not in the library, so check them here.
         for u in &file.uses {
             if let items::SkillSource::Inline(skill) = &u.skill {
@@ -260,18 +313,35 @@ pub fn load_items() -> Result<usize, Vec<String>> {
             }
         }
     }
+    let upgrades: Upgrades = items::link_upgrades(upgrades, &set);
+    for def in set.values() {
+        if let Some(id) = &def.upgrade
+            && !upgrades.contains_key(id)
+        {
+            let list: Vec<&str> = upgrades.keys().map(String::as_str).collect();
+            problems.push(format!("item `{}`: unknown upgrade `{id}` (upgrades.kdl has: {})", def.id, list.join(", ")));
+        }
+    }
     // `self.<stat>` must be a stat that exists (a typo otherwise reads 0).
     let known = stats::known_names(&declared);
-    for (stat, at) in stat_refs {
-        if !known.contains(&stat) {
+    for (stat, at) in &stat_refs {
+        if !known.contains(items::split_stat(stat).0) {
             let list: Vec<&str> = known.iter().map(String::as_str).collect();
             problems.push(format!("{at}: unknown stat `self.{stat}` (known: {})", list.join(", ")));
         }
     }
-    for (stat, at) in format_refs {
-        if !known.contains(&stat) {
+    for (stat, at) in &format_refs {
+        if !known.contains(items::split_stat(stat).0) {
             let list: Vec<&str> = known.iter().map(String::as_str).collect();
             problems.push(format!("{at}: unknown stat `{stat}` (known: {})", list.join(", ")));
+        }
+    }
+    problems.extend(items::check_stat_elements(&stat_refs, &taggable, &elements));
+    problems.extend(items::check_stat_elements(&format_refs, &taggable, &elements));
+    for (element, at) in element_refs {
+        if !elements.elements.contains_key(&element) {
+            let list: Vec<&str> = elements.elements.keys().map(String::as_str).collect();
+            problems.push(format!("{at}: unknown element `{element}` (elements.kdl has: {})", list.join(", ")));
         }
     }
     for (kind, at) in kind_refs {
@@ -286,7 +356,11 @@ pub fn load_items() -> Result<usize, Vec<String>> {
     let count = set.len();
     *ITEMS.write().unwrap() = set;
     *REFORGES.write().unwrap() = reforges;
+    *UPGRADES.write().unwrap() = upgrades;
     *KINDS.write().unwrap() = kinds;
+    formats.element_names = elements.elements.values().map(|e| (e.id.clone(), format!("{}{}", e.color, e.name))).collect();
+    formats.element_colors = elements.elements.values().map(|e| (e.id.clone(), e.color.clone())).collect();
+    *ELEMENTS.write().unwrap() = Some(Arc::new(elements));
     *STAT_FORMATS.write().unwrap() = Some(Arc::new(formats));
     Ok(count)
 }
@@ -299,6 +373,27 @@ fn stat_formats() -> Arc<StatFormats> {
 /// A damage kind from kinds.kdl.
 pub(crate) fn kind(id: &str) -> Option<DamageKind> {
     KINDS.read().unwrap().get(id).cloned()
+}
+
+/// `elements.kdl`.
+pub(crate) fn elements() -> Arc<Elements> {
+    ELEMENTS.read().unwrap().clone().unwrap_or_default()
+}
+
+/// What a hit on a player is multiplied by: their `defense_stat` (including
+/// what is tagged with an element) and the attack's element against their mix
+/// of defense stats. `weapon` is the attacker's stats for a melee hit, which
+/// takes its elements from their `damage` instead of `attack`.
+pub(crate) fn hit_multiplier(defense_stat: Option<&str>, attack: Option<&str>, weapon: Option<&PlayerStats>, target: &PlayerStats) -> f64 {
+    let defense = defense_stat.map_or(0.0, |stat| items::stat_total(target, stat)).max(0.0);
+    let kinds = KINDS.read().unwrap();
+    let is_defense = |stat: &str| stat == "defense" || kinds.values().any(|k| k.defense.as_deref() == Some(stat));
+    let elements = elements();
+    let element = match weapon {
+        Some(weapon) => elements.melee(weapon, target, &is_defense),
+        None => elements.against(attack, target, &is_defense),
+    };
+    100.0 / (100.0 + defense) * element
 }
 
 /// The first kind (by id) whose `source` is this Minecraft damage type.
@@ -382,23 +477,39 @@ fn set_attribute(stack: &ItemStack, slot: Slot, attribute: Attribute, id: &str, 
     });
 }
 
+/// The id vanilla armor pieces use for their armor modifier in this slot.
+fn base_armor_id(slot: Slot) -> Option<&'static str> {
+    match slot {
+        Slot::Head => Some("minecraft:armor.helmet"),
+        Slot::Chest => Some("minecraft:armor.chestplate"),
+        Slot::Legs => Some("minecraft:armor.leggings"),
+        Slot::Feet => Some("minecraft:armor.boots"),
+        Slot::MainHand | Slot::OffHand => None,
+    }
+}
+
 /// What this stack has on top of its definition.
 pub(crate) fn instance_of(stack: &ItemStack) -> Instance {
-    Instance::decode(stack.get_string(NS, "reforge"), stack.get_string(NS, "gems"))
+    Instance::decode(stack.get_string(NS, "reforge"), stack.get_string(NS, "gems"), stack.get_string(NS, "upgrades"))
 }
 
 fn reforge(id: &str) -> Option<Arc<ReforgeDef>> {
     REFORGES.read().unwrap().get(id).cloned()
 }
 
-fn apply_instance(def: &ItemDef, instance: &Instance) -> ItemDef {
-    def.with_instance(instance, item, reforge)
+fn upgrade(id: &str) -> Option<Arc<UpgradeDef>> {
+    UPGRADES.read().unwrap().get(id).cloned()
 }
 
-/// The relic this stack is, with its reforge and gems. Gems give nothing until
-/// socketed, so a loose one is not a relic here.
+fn apply_instance(def: &ItemDef, instance: &Instance) -> ItemDef {
+    def.with_instance(instance, item, reforge, upgrade)
+}
+
+/// The relic this stack is, with its reforge, gems and upgrades. Gems give
+/// nothing until socketed and upgrade items nothing until used, so loose ones
+/// are not relics here.
 pub(crate) fn relic_of(stack: &ItemStack) -> Option<Arc<ItemDef>> {
-    let def = item(&stack.get_string(NS, "id")?).filter(|d| d.gem.is_none())?;
+    let def = item(&stack.get_string(NS, "id")?).filter(|d| d.is_relic())?;
     let instance = instance_of(stack);
     if instance == Instance::default() {
         return Some(def);
@@ -428,13 +539,23 @@ pub(crate) fn build_stack(base: &ItemDef, instance: &Instance, count: u8, stats:
     // 4 base attack speed; the tooltip shows totals, so store the difference
     // under the vanilla ids to replace the base item's own values.
     let (slot, add) = (def.slot, ModifierOperation::Add);
-    let attributes = if def.gem.is_some() { None } else { Some(&def.stats) };
+    let attributes = if def.is_relic() { Some(&def.stats) } else { None };
+    // Protection comes from the `defense` stat, so zero the base item's vanilla
+    // armor (under its own id, or it would add up). `remove_attribute_modifiers`
+    // can't do this: emptying the list falls back to the base item's values.
+    if let Some(id) = base_armor_id(slot) {
+        set_attribute(&stack, slot, Attribute::Armor, id, 0.0, add);
+    }
+    // Every part of `damage` is in the vanilla hit; `OnHit` sorts out elements.
+    if let Some(stats) = attributes
+        && stats.keys().any(|k| items::split_stat(k).0 == "damage")
+    {
+        set_attribute(&stack, slot, Attribute::AttackDamage, "minecraft:base_attack_damage", items::stat_total(stats, "damage") - 1.0, add);
+    }
     for (stat, &value) in attributes.into_iter().flatten() {
         match stat.as_str() {
-            "damage" => set_attribute(&stack, slot, Attribute::AttackDamage, "minecraft:base_attack_damage", value - 1.0, add),
             "attack_speed" => set_attribute(&stack, slot, Attribute::AttackSpeed, "minecraft:base_attack_speed", value - 4.0, add),
             "health" => set_attribute(&stack, slot, Attribute::MaxHealth, "reliquary:health", value, add),
-            "armor" => set_attribute(&stack, slot, Attribute::Armor, "reliquary:armor", value, add),
             "armor_toughness" => set_attribute(&stack, slot, Attribute::ArmorToughness, "reliquary:armor_toughness", value, add),
             // Percent: `speed 10` = 10% faster.
             "speed" => set_attribute(&stack, slot, Attribute::MovementSpeed, "reliquary:speed", value / 100.0, ModifierOperation::MultiplyBase),
@@ -465,6 +586,9 @@ pub(crate) fn build_stack(base: &ItemDef, instance: &Instance, count: u8, stats:
     }
     if let Some(gems) = instance.encode_gems() {
         stack.set_string(NS, "gems", &gems);
+    }
+    if let Some(upgrades) = instance.encode_upgrades() {
+        stack.set_string(NS, "upgrades", &upgrades);
     }
     stack
 }
@@ -553,12 +677,12 @@ fn fire_from(
     }
     let key = player_key(&player);
     let stats = Arc::new(stats::for_cast(&player));
-    let mut cast = Cast { server, caster: player, victim: other, params: Arc::default(), stats: stats.clone(), from_proc };
+    let cast = Cast { server, caster: player, victim: other, params: Default::default(), stats: stats.clone(), from_proc };
     let mut used = false;
     for def in items {
         for (index, skill) in def.skills.iter().enumerate() {
             if when(skill.skill.trigger) {
-                cast.params = skill.params.clone();
+                cast.params.replace(skill.params.clone());
                 used |= engine::try_cast(&cast, def, index);
             }
         }
@@ -700,6 +824,32 @@ impl CommandHandler for Give {
     }
 }
 
+/// `/relic equip <id>`: puts a relic on the mob you are looking at, in the slot
+/// the relic is made for.
+struct Equip;
+impl CommandHandler for Equip {
+    fn handle(&self, sender: CommandSender, _: Server, args: ConsumedArgs) -> Result<i32, CommandError> {
+        let player = sender.as_player().ok_or_else(|| fail("Only players can use this."))?;
+        let Arg::Simple(id) = args.get_value("id") else {
+            return Err(fail("Missing item id."));
+        };
+        let def = item(&id).filter(|d| d.is_relic()).ok_or_else(|| fail(&format!("No relic `{id}`.")))?;
+        let hit = player.ray_trace_entity(EQUIP_RANGE).ok_or_else(|| fail("Look at a mob first."))?;
+        let living = hit.entity.as_living().filter(|l| l.is_mob()).ok_or_else(|| fail("Look at a mob first."))?;
+        let slot = match def.slot {
+            Slot::MainHand => EquipmentSlot::MainHand,
+            Slot::OffHand => EquipmentSlot::OffHand,
+            Slot::Head => EquipmentSlot::Head,
+            Slot::Chest => EquipmentSlot::Chest,
+            Slot::Legs => EquipmentSlot::Legs,
+            Slot::Feet => EquipmentSlot::Feet,
+        };
+        living.set_equipment(slot, Some(build_stack(&def, &Instance::default(), 1, &PlayerStats::new())));
+        sender.send_message(text(&format!("&aPut {} on the mob ({:?})", def.display_name(), def.slot)));
+        Ok(1)
+    }
+}
+
 struct Menu;
 impl CommandHandler for Menu {
     fn handle(&self, sender: CommandSender, _: Server, _: ConsumedArgs) -> Result<i32, CommandError> {
@@ -757,8 +907,8 @@ fn held_for_forge(player: &Player) -> Result<(Arc<ItemDef>, Instance), CommandEr
         .get_string(NS, "id")
         .and_then(|id| item(&id))
         .ok_or_else(|| fail("That isn't a Reliquary item."))?;
-    if def.gem.is_some() {
-        return Err(fail("Hold the item you want to change, not a gem."));
+    if !def.is_relic() {
+        return Err(fail("Hold the item you want to change, not a gem or upgrade."));
     }
     if stack.get_count() != 1 {
         return Err(fail("Hold just one of it."));
@@ -873,6 +1023,37 @@ impl CommandHandler for Unsocket {
     }
 }
 
+/// `/relic upgrade`: uses one upgrade item from the offhand on the main-hand relic.
+struct Upgrade;
+impl CommandHandler for Upgrade {
+    fn handle(&self, sender: CommandSender, _: Server, _: ConsumedArgs) -> Result<i32, CommandError> {
+        let player = sender.as_player().ok_or_else(|| fail("Only players can use this."))?;
+        let (def, mut instance) = held_for_forge(&player)?;
+        let off_hand = player.get_inventory().get_off_hand().ok_or_else(|| fail("Hold an upgrade in your offhand."))?;
+        let upgrade_item = off_hand
+            .get_string(NS, "id")
+            .and_then(|id| item(&id))
+            .filter(|d| d.upgrade.is_some())
+            .ok_or_else(|| fail("Hold an upgrade in your offhand."))?;
+        let chosen = upgrade_item.upgrade.as_deref().and_then(upgrade).ok_or_else(|| fail("That upgrade no longer exists."))?;
+        if chosen.bonus_for(&def).is_none() {
+            return Err(fail(&format!("{} doesn't work on {}.", upgrade_item.name, def.name)));
+        }
+        let count = instance.upgrade_count(&chosen.id);
+        if count >= chosen.max {
+            return Err(fail(&format!("{} already has the most {} it can take ({}).", def.name, chosen.name, chosen.max)));
+        }
+
+        instance.upgrades.insert(chosen.id.clone(), count + 1);
+        forge_result(&player, &def, &instance);
+        let left = off_hand.get_count().saturating_sub(1);
+        let rest = (left > 0).then(|| build_stack(&upgrade_item, &Instance::default(), left, &stats::current(&player)));
+        player.set_item_in_hand(Hand::Left, rest);
+        sender.send_message(text(&format!("&aApplied {} &ato {} ({}/{})", upgrade_item.display_name(), def.display_name(), count + 1, chosen.max)));
+        Ok(1)
+    }
+}
+
 /// `/relic reforges`: every reforge, and whether it fits the held item.
 struct ListReforges;
 impl CommandHandler for ListReforges {
@@ -928,9 +1109,30 @@ impl EventHandler<PlayerInteractEvent> for OnInteract {
 
 struct OnHit;
 impl EventHandler<EntityDamageByEntityEvent> for OnHit {
-    fn handle(&self, server: Server, event: EventData<EntityDamageByEntityEvent>) -> EventData<EntityDamageByEntityEvent> {
+    fn handle(&self, server: Server, mut event: EventData<EntityDamageByEntityEvent>) -> EventData<EntityDamageByEntityEvent> {
         // The event only has entity ids, so find the attacker and victim by id.
         crate::triggers::note_attacker(event.entity_id as u32, event.damager_id as u32);
+        // Skill damage has no attacker: it never gets here, and applies defense
+        // and elements in the `damage` mechanic.
+        if let Some((target, _)) = crate::indicators::find(&server, event.entity_id as u32) {
+            let source = crate::indicators::current_source(event.entity_id as u32);
+            // A kind with this source decides the defense; anything else from
+            // another entity (mobs, arrows, ...) is plain `defense`.
+            let defense = match source.as_deref().and_then(kind_for_source) {
+                Some(kind) => kind.defense,
+                None => Some("defense".to_string()),
+            };
+            // Only melee uses the attacker's weapon: not thorns, arrows and so on.
+            let melee = matches!(source.as_deref(), Some("player_attack" | "mob_attack" | "mob_attack_no_aggro"));
+            let weapon = crate::indicators::find(&server, event.damager_id as u32)
+                .filter(|_| melee)
+                .map(|(attacker, _)| stats::of_entity(&server, &attacker));
+            if let Some(weapon) = &weapon {
+                crate::indicators::note_elements(event.entity_id as u32, items::damage_elements(weapon));
+            }
+            let multiplier = hit_multiplier(defense.as_deref(), None, weapon.as_ref(), &stats::of_entity(&server, &target));
+            event.damage = (f64::from(event.damage) * multiplier) as f32;
+        }
         let attacker = server
             .get_all_players()
             .into_iter()
@@ -1005,6 +1207,11 @@ pub fn register(context: &Context) -> Result<(), String> {
                     .execute(Give),
             ),
         )
+        .then(
+            CommandNode::literal("equip").then(
+                CommandNode::argument("id", &ArgumentType::String(StringType::SingleWord)).execute(Equip),
+            ),
+        )
         .then(CommandNode::literal("list").execute(List))
         .then(CommandNode::literal("reforges").execute(ListReforges))
         .then(
@@ -1022,6 +1229,7 @@ pub fn register(context: &Context) -> Result<(), String> {
                 .execute(Unsocket)
                 .then(CommandNode::argument("socket", &ArgumentType::Integer((Some(1), None))).execute(Unsocket)),
         )
+        .then(CommandNode::literal("upgrade").execute(Upgrade))
         .then(CommandNode::literal("reload").execute(Reload))
         .then(
             CommandNode::literal("stats")

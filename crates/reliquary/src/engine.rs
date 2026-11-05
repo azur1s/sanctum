@@ -2,7 +2,10 @@
 //! mechanics. Delayed parts (`wait`, `repeat`) go through the scheduler and
 //! look entities up again by id, since entities can die or leave meanwhile.
 
-use std::sync::Arc;
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use pumpkin_plugin_api::{
     Entity, Player, Server, scheduler::SchedulerExt,
@@ -10,7 +13,7 @@ use pumpkin_plugin_api::{
     wit::pumpkin::plugin::{sounds::SoundCategory, status_effect::StatusEffectInstance},
 };
 
-use crate::items::{Action, Actions, Check, Condition, ItemDef, ItemSkill, Mechanic, Num, Params, PlayerStats, Scope, Targeter, Trigger};
+use crate::items::{Action, Actions, Check, Condition, ItemDef, ItemSkill, Mechanic, Num, Params, PlayerStats, Scope, Targeter, Trigger, stat_key};
 use crate::{mana, names};
 
 type Vec3 = (f64, f64, f64);
@@ -21,8 +24,9 @@ pub struct Cast<'a> {
     pub caster: Player,
     /// The hit entity, for `hit` skills.
     pub victim: Option<Entity>,
-    /// Param values for this item's use of the skill.
-    pub params: Arc<Params>,
+    /// Param values for this item's use of the skill, plus the `repeat` vars
+    /// of whatever is running now.
+    pub params: RefCell<Arc<Params>>,
     /// The caster's stats when the skill started (for `self.<stat>`).
     pub stats: Arc<PlayerStats>,
     /// Started by `triggers-hit`: its own damage does not trigger hits again.
@@ -31,7 +35,19 @@ pub struct Cast<'a> {
 
 impl Cast<'_> {
     fn num(&self, n: &Num) -> f64 {
-        n.get(Scope { params: &self.params, stats: &self.stats })
+        let params = self.params.borrow();
+        n.get(Scope { params: &params, stats: &self.stats })
+    }
+
+    /// Runs `f` with `var` (if any) set to `i`. Anything `f` schedules keeps the value.
+    fn with_var<T>(&self, var: Option<&str>, i: u32, f: impl FnOnce() -> T) -> T {
+        let Some(var) = var else { return f() };
+        let mut params = Params::clone(&self.params.borrow());
+        params.insert(var.to_string(), f64::from(i));
+        let outer = self.params.replace(Arc::new(params));
+        let result = f();
+        self.params.replace(outer);
+        result
     }
 }
 
@@ -89,6 +105,25 @@ pub fn text(s: &str) -> TextComponent {
 
 pub use crate::items::cooldown_group;
 
+/// Minimum time between two identical denial messages to one player.
+const NOTICE_DELAY: Duration = Duration::from_secs(1);
+
+static LAST_NOTICE: Mutex<Option<HashMap<(String, &'static str), Instant>>> = Mutex::new(None);
+
+/// Tells `player` why a cast was denied, at most once per `NOTICE_DELAY` per
+/// kind, so spamming or holding right click doesn't flood the chat.
+fn notice(player: &Player, kind: &'static str, msg: &str) {
+    let now = Instant::now();
+    let mut guard = LAST_NOTICE.lock().unwrap();
+    let last = guard.get_or_insert_with(HashMap::new);
+    let key = (player.get_id().to_string(), kind);
+    if last.get(&key).is_some_and(|t| now.duration_since(*t) < NOTICE_DELAY) {
+        return;
+    }
+    last.insert(key, now);
+    player.send_system_message(text(msg), false);
+}
+
 /// A random number in 0.0..1.0, from the server's UUID generator.
 /// Uses the low 53 bits: the top bits of a v4 UUID are fixed variant bits.
 pub(crate) fn random() -> f64 {
@@ -112,6 +147,11 @@ pub fn try_cast(cast: &Cast, item: &ItemDef, skill_index: usize) -> bool {
     }
     let group = cooldown_group(item, skill_index);
     if use_.cooldown > 0.0 && cast.caster.is_on_cooldown(&group) {
+        if skill.trigger != Trigger::Hit {
+            // get_cooldown is the fraction left, so scale by the full duration.
+            let left = (cast.caster.get_cooldown(&group) * use_.cooldown).ceil().max(1.0) as u32;
+            notice(&cast.caster, "cooldown", &format!("&cThis ability is on cooldown for {left}s"));
+        }
         return false;
     }
     // A required target block that finds nothing cancels the skill for free.
@@ -126,7 +166,7 @@ pub fn try_cast(cast: &Cast, item: &ItemDef, skill_index: usize) -> bool {
     let key = cast.caster.get_id().to_string();
     if use_.mana_cost > 0 && mana::try_spend(&key, use_.mana_cost).is_none() {
         if skill.trigger != Trigger::Hit {
-            cast.caster.show_actionbar(text("&cNot enough mana"));
+            notice(&cast.caster, "mana", "&cNot enough mana");
         }
         return false;
     }
@@ -152,10 +192,10 @@ fn run(cast: &Cast, actions: &Actions, from: usize, subject: &Subject) {
                 later(cast, subject, ticks, move |cast, subject| run(cast, &rest, i + 1, subject));
                 return;
             }
-            Action::Repeat { times, every, actions: body } => {
-                run(cast, body, 0, subject);
-                let (times, every) = (cast.num(times).max(0.0) as u32, cast.num(every).max(1.0) as u32);
-                repeat(cast, subject, body.clone(), times.saturating_sub(1), every);
+            Action::Repeat { times, every, var, actions: body } => {
+                let times = cast.num(times).max(0.0) as u32;
+                let looping = Looping { body: body.clone(), every: every.clone(), var: var.clone(), last: times.saturating_sub(1) };
+                repeat(cast, subject, looping, 0);
             }
             Action::Target { targeter, filter, actions: body, .. } => {
                 for target in targets(cast, targeter, filter, subject) {
@@ -290,14 +330,26 @@ fn chain_step(cast: &Cast, target: &Entity, mut link: ChainLink) {
     });
 }
 
-fn repeat(cast: &Cast, subject: &Subject, body: Actions, left: u32, every: u32) {
-    if left == 0 {
-        return;
-    }
-    later(cast, subject, every, move |cast, subject| {
-        run(cast, &body, 0, subject);
-        repeat(cast, subject, body.clone(), left - 1, every);
+/// The state of a `repeat` between iterations.
+#[derive(Clone)]
+struct Looping {
+    body: Actions,
+    every: Num,
+    var: Option<String>,
+    /// The final iteration number.
+    last: u32,
+}
+
+/// Runs iteration `i`, then schedules the next after the gap `i` asks for.
+fn repeat(cast: &Cast, subject: &Subject, looping: Looping, i: u32) {
+    let var = looping.var.as_deref();
+    let ticks = cast.with_var(var, i, || {
+        run(cast, &looping.body, 0, subject);
+        cast.num(&looping.every).max(1.0) as u32
     });
+    if i < looping.last {
+        later(cast, subject, ticks, move |cast, subject| repeat(cast, subject, looping.clone(), i + 1));
+    }
 }
 
 /// Calls `f` after `ticks`, with fresh handles for the caster and subject.
@@ -308,7 +360,7 @@ fn later(cast: &Cast, subject: &Subject, ticks: u32, f: impl Fn(&Cast, &Subject)
     }
     let caster_id = cast.caster.get_id().to_string();
     let victim_id = cast.victim.as_ref().map(Entity::get_id);
-    let (params, stats, from_proc) = (cast.params.clone(), cast.stats.clone(), cast.from_proc);
+    let (params, stats, from_proc) = (cast.params.borrow().clone(), cast.stats.clone(), cast.from_proc);
     let saved = match subject {
         Subject::Entity(e) => Saved::Entity(e.get_id()),
         Subject::Point(p) => Saved::Point(*p),
@@ -325,7 +377,7 @@ fn later(cast: &Cast, subject: &Subject, ticks: u32, f: impl Fn(&Cast, &Subject)
             },
             Saved::Point(p) => Subject::Point(p),
         };
-        f(&Cast { server: &server, caster, victim, params: params.clone(), stats: stats.clone(), from_proc }, &subject);
+        f(&Cast { server: &server, caster, victim, params: RefCell::new(params.clone()), stats: stats.clone(), from_proc }, &subject);
     });
 }
 
@@ -515,6 +567,16 @@ fn player_of(cast: &Cast, e: &Entity) -> Option<Player> {
     cast.server.get_all_players().into_iter().find(|p| p.as_entity().get_id() == id)
 }
 
+/// Sets an entity's velocity. Players go through their own handle: `Entity`'s
+/// only stores the value on the server, and a player's client moves itself, so
+/// it needs the velocity packet that `Player`'s sends.
+fn push(cast: &Cast, e: &Entity, velocity: Vec3) {
+    match player_of(cast, e) {
+        Some(player) => player.set_velocity(velocity),
+        None => e.set_velocity(velocity),
+    }
+}
+
 fn apply(cast: &Cast, mechanic: &Mechanic, subject: &Subject) {
     let n = |v: &Num| cast.num(v);
     let world = cast.caster.get_world();
@@ -550,32 +612,29 @@ fn apply(cast: &Cast, mechanic: &Mechanic, subject: &Subject) {
     // The loader rejects entity mechanics on points, so this is a no-op guard.
     let Subject::Entity(e) = subject else { return };
     match mechanic {
-        Mechanic::Damage { amount, kind, scale, source, triggers_hit } => {
+        Mechanic::Damage { amount, kind, element, scale, source, triggers_hit } => {
             let kind = kind.as_deref().and_then(crate::game::kind);
-            let power = kind
-                .as_ref()
-                .and_then(|k| k.power.as_ref())
-                .and_then(|stat| cast.stats.get(stat))
-                .copied()
-                .unwrap_or(0.0);
+            // The kind's power stat, plus what is tagged with this hit's element.
+            let power = kind.as_ref().and_then(|k| k.power.as_ref()).map_or(0.0, |stat| {
+                let own = cast.stats.get(stat).copied().unwrap_or(0.0);
+                let tagged = element.as_ref().and_then(|el| cast.stats.get(&stat_key(stat, Some(el)))).copied().unwrap_or(0.0);
+                own + tagged
+            });
             let source = source
                 .as_deref()
                 .or(kind.as_ref().map(|k| k.source.as_str()))
                 .unwrap_or("generic");
             let mut total = n(amount) + power * n(scale);
-            // The target's defense for this kind (only players have stats).
-            if let Some(stat) = kind.as_ref().and_then(|k| k.defense.as_ref())
-                && let Some(target) = player_of(cast, e)
-            {
-                let defense = crate::stats::current(&target).get(stat).copied().unwrap_or(0.0).max(0.0);
-                total *= 100.0 / (100.0 + defense);
-            }
+            // The target's defense for this kind and its element mix.
+            let stats = crate::stats::of_entity(cast.server, e);
+            total *= crate::game::hit_multiplier(kind.as_ref().and_then(|k| k.defense.as_deref()), element.as_deref(), None, &stats);
             if let (Some(living), Some(source)) = (e.as_living(), names::damage_type(source)) {
                 living.damage(total as f32, source);
                 // Skill damage has no attacker in the API, so remember it for
                 // `kill` and for damage numbers.
                 crate::triggers::note_hit(e.get_id(), &cast.caster);
                 crate::indicators::note_player_damage(e.get_id(), kind.as_ref().map(|k| k.id.as_str()));
+                crate::indicators::note_elements(e.get_id(), element.iter().cloned().collect());
                 if *triggers_hit && !cast.from_proc && e.get_id() != cast.caster.as_entity().get_id() {
                     crate::game::proc_hit(cast.server, &cast.caster, e);
                 }
@@ -593,7 +652,7 @@ fn apply(cast: &Cast, mechanic: &Mechanic, subject: &Subject) {
             let d = if caster.get_id() == e.get_id() { look(&caster) } else { sub(e.get_position(), caster.get_position()) };
             let len = (d.0 * d.0 + d.2 * d.2).sqrt().max(1e-6);
             let s = n(strength);
-            e.set_velocity((d.0 / len * s, n(up), d.2 / len * s));
+            push(cast, e, (d.0 / len * s, n(up), d.2 / len * s));
         }
         Mechanic::Effect { effect, seconds, level } => {
             if let (Some(player), Some(kind)) = (player_of(cast, e), names::status_effect(effect)) {
@@ -617,13 +676,13 @@ fn apply(cast: &Cast, mechanic: &Mechanic, subject: &Subject) {
         }
         Mechanic::Dash { strength, up } => {
             let dir = look(&cast.caster.as_entity());
-            e.set_velocity(add(scale(dir, n(strength)), (0.0, n(up), 0.0)));
+            push(cast, e, add(scale(dir, n(strength)), (0.0, n(up), 0.0)));
         }
         Mechanic::Pull { strength } => {
             let d = sub(cast.caster.as_entity().get_position(), e.get_position());
             let len = (d.0 * d.0 + d.2 * d.2).sqrt().max(1e-6);
             let s = n(strength);
-            e.set_velocity((d.0 / len * s, 0.25 * s, d.2 / len * s));
+            push(cast, e, (d.0 / len * s, 0.25 * s, d.2 / len * s));
         }
         Mechanic::Blink { distance } => {
             let caster = cast.caster.as_entity();

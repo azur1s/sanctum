@@ -3,7 +3,8 @@
 //
 // Stats the plugin knows:
 //   max-mana, mana-regen            plugin mana
-//   health, armor, armor-toughness  vanilla attributes (shown by the vanilla tooltip)
+//   health, armor-toughness  vanilla attributes (shown by the vanilla tooltip)
+//   defense, magic-defense   reduce damage: damage × 100 / (100 + defense)
 //   speed                           percent, `speed 10` = 10% faster
 //   damage, attack-speed            main-hand items only
 // Any other stat is custom. Damage kind stats (magic-power, strength) come
@@ -20,7 +21,7 @@ item "starweave_hood" {
     stats {
         magic-power 10
         max-mana    20
-        magic-armor 10
+        magic-defense 10
     }
 
     skill "stardust"
@@ -37,7 +38,7 @@ item "starweave_robe" {
     stats {
         magic-power 20
         max-mana    30
-        magic-armor 25
+        magic-defense 25
         health      4
     }
 

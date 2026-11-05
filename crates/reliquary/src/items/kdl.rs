@@ -40,11 +40,13 @@ pub struct Parsed {
     pub declared_stats: Vec<String>,
     /// `damage ... kind="x"` uses, with "file:line:col", checked against kinds.kdl.
     pub kind_refs: Vec<(String, String)>,
+    /// `damage ... element="x"` uses, with "file:line:col", checked against elements.kdl.
+    pub element_refs: Vec<(String, String)>,
 }
 
 /// Parses `kinds.kdl`: only `kind` nodes.
 pub fn parse_kinds(file: &str, src: &str) -> R<Vec<DamageKind>> {
-    let p = Parser { file, src, used_params: RefCell::default(), used_stats: RefCell::default(), used_kinds: RefCell::default() };
+    let p = Parser { file, src, used_params: RefCell::default(), used_stats: RefCell::default(), used_kinds: RefCell::default(), used_elements: RefCell::default(), loop_vars: RefCell::default() };
     let doc = p.document()?;
     let mut kinds: Vec<DamageKind> = Vec::new();
     for node in doc.nodes() {
@@ -68,7 +70,7 @@ pub fn parse_kinds(file: &str, src: &str) -> R<Vec<DamageKind>> {
                     power = Some(stat);
                 }
                 "defense" => {
-                    let entry = p.arg(child, 0, "a stat, like `defense \"magic-armor\"`")?;
+                    let entry = p.arg(child, 0, "a stat, like `defense \"magic-defense\"`")?;
                     p.shape(child, 1, &[], false)?;
                     let stat = p.string(entry)?.replace('-', "_");
                     p.stat_name(entry, &stat)?;
@@ -95,9 +97,85 @@ pub fn parse_kinds(file: &str, src: &str) -> R<Vec<DamageKind>> {
     Ok(kinds)
 }
 
+/// Parses `elements.kdl`: at most one `element-defaults`, then `element` nodes.
+pub fn parse_elements(file: &str, src: &str) -> R<Elements> {
+    let p = Parser { file, src, used_params: RefCell::default(), used_stats: RefCell::default(), used_kinds: RefCell::default(), used_elements: RefCell::default(), loop_vars: RefCell::default() };
+    let doc = p.document()?;
+    let mut elements = Elements::default();
+    let mut defaults_node = None;
+    let mut targets = Vec::new();
+    let multiplier = |entry: &KdlEntry| -> R<f64> {
+        let value = p.number(entry)?;
+        if value < 0.0 {
+            return Err(p.at_entry(entry, "a multiplier can't be negative"));
+        }
+        Ok(value)
+    };
+    for node in doc.nodes() {
+        match name(node) {
+            "element-defaults" => {
+                if defaults_node.replace(node).is_some() {
+                    return Err(p.at(node, "`element-defaults` is set twice"));
+                }
+                p.shape(node, 0, &["default", "self"], false)?;
+                if let Some(e) = prop(node, "default") {
+                    elements.default = multiplier(e)?;
+                }
+                if let Some(e) = prop(node, "self") {
+                    elements.same = multiplier(e)?;
+                }
+            }
+            "element" => {
+                let id = p.id(node, "an element id, like `element \"fire\" { ... }`")?;
+                p.shape(node, 1, &[], true)?;
+                if id == forge::INHERIT {
+                    return Err(p.at(node, format!("`{id}` can't be an element: upgrades use `element=\"{id}\"` to follow the item's elements")));
+                }
+                if elements.elements.contains_key(&id) {
+                    return Err(p.at(node, format!("element `{id}` is defined twice")));
+                }
+                let mut def = ElementDef { id: id.clone(), name: String::new(), color: String::new(), icon: String::new(), multipliers: BTreeMap::new() };
+                for child in children(node) {
+                    match name(child) {
+                        "name" => def.name = p.str_arg(child, "a name, like \"Fire\"")?,
+                        "color" => def.color = p.str_arg(child, "color codes, like \"&c\"")?,
+                        "icon" => def.icon = p.str_arg(child, "text, like an icon from a resource pack font")?,
+                        "multipliers" => {
+                            p.shape(child, 0, &[], true)?;
+                            for entry in children(child) {
+                                let target = name(entry).to_string();
+                                p.shape(entry, 1, &[], false)?;
+                                let value = multiplier(p.arg(entry, 0, "a multiplier, like `\"water\" 1.25`")?)?;
+                                if def.multipliers.insert(target.clone(), value).is_some() {
+                                    return Err(p.at(entry, format!("element `{target}` is listed twice")));
+                                }
+                                targets.push((target, entry));
+                            }
+                        }
+                        other => return Err(p.at(child, format!("unknown element field `{other}` (expected name, color, icon or multipliers)"))),
+                    }
+                }
+                if def.name.is_empty() {
+                    return Err(p.at(node, format!("element `{id}` needs a `name`")));
+                }
+                elements.elements.insert(id, def);
+            }
+            other => return Err(p.at(node, format!("expected `element-defaults` or `element`, found `{other}`"))),
+        }
+    }
+    // A typo here would silently fall back to the default multiplier.
+    for (target, entry) in targets {
+        if !elements.elements.contains_key(&target) {
+            let list: Vec<&str> = elements.elements.keys().map(String::as_str).collect();
+            return Err(p.at(entry, format!("unknown element `{target}` (this file has: {})", list.join(", "))));
+        }
+    }
+    Ok(elements)
+}
+
 /// Parses `item_rarity.kdl`: only `rarity` nodes, kept in file order.
 pub fn parse_rarities(file: &str, src: &str) -> R<Vec<RarityDef>> {
-    let p = Parser { file, src, used_params: RefCell::default(), used_stats: RefCell::default(), used_kinds: RefCell::default() };
+    let p = Parser { file, src, used_params: RefCell::default(), used_stats: RefCell::default(), used_kinds: RefCell::default(), used_elements: RefCell::default(), loop_vars: RefCell::default() };
     let doc = p.document()?;
     let mut rarities: Vec<RarityDef> = Vec::new();
     for node in doc.nodes() {
@@ -129,7 +207,7 @@ pub fn parse_rarities(file: &str, src: &str) -> R<Vec<RarityDef>> {
 /// Parses `reforges.kdl`: only `reforge` nodes. Also returns each stat with its
 /// "file:line:col", to check custom stats are declared.
 pub fn parse_reforges(file: &str, src: &str) -> R<(Vec<ReforgeDef>, Vec<(String, String)>)> {
-    let p = Parser { file, src, used_params: RefCell::default(), used_stats: RefCell::default(), used_kinds: RefCell::default() };
+    let p = Parser { file, src, used_params: RefCell::default(), used_stats: RefCell::default(), used_kinds: RefCell::default(), used_elements: RefCell::default(), loop_vars: RefCell::default() };
     let doc = p.document()?;
     let mut reforges: Vec<ReforgeDef> = Vec::new();
     let mut stat_refs = Vec::new();
@@ -156,21 +234,8 @@ pub fn parse_reforges(file: &str, src: &str) -> R<(Vec<ReforgeDef>, Vec<(String,
                         return Err(p.at(child, "`weight` must be above 0"));
                     }
                 }
-                "slots" => {
-                    p.shape(child, usize::MAX, &[], false)?;
-                    for entry in args(child) {
-                        let value = p.string(entry)?;
-                        reforge.slots.push(Slot::parse(&value).ok_or_else(|| {
-                            p.at_entry(entry, format!("unknown slot `{value}` (expected mainhand, offhand, head, chest, legs or feet)"))
-                        })?);
-                    }
-                }
-                "kinds" => {
-                    p.shape(child, usize::MAX, &[], false)?;
-                    for entry in args(child) {
-                        reforge.kinds.push(p.string(entry)?);
-                    }
-                }
+                "slots" => reforge.slots.extend(p.slot_filter(child)?),
+                "kinds" => reforge.kinds.extend(p.kind_filter(child)?),
                 "stats" => {
                     let (stats, at) = p.stats(child)?;
                     reforge.stats = stats;
@@ -193,11 +258,55 @@ pub fn parse_reforges(file: &str, src: &str) -> R<(Vec<ReforgeDef>, Vec<(String,
     Ok((reforges, stat_refs))
 }
 
+/// Parses `upgrades.kdl`: only `upgrade` nodes. Also returns each plain stat and
+/// each inherited stat (as its plain name) with its "file:line:col", for the
+/// loader's checks.
+#[allow(clippy::type_complexity)]
+pub fn parse_upgrades(file: &str, src: &str) -> R<(Vec<UpgradeDef>, Vec<(String, String)>, Vec<(String, String)>)> {
+    let p = Parser { file, src, used_params: RefCell::default(), used_stats: RefCell::default(), used_kinds: RefCell::default(), used_elements: RefCell::default(), loop_vars: RefCell::default() };
+    let doc = p.document()?;
+    let mut upgrades: Vec<UpgradeDef> = Vec::new();
+    let (mut stat_refs, mut inherit_refs) = (Vec::new(), Vec::new());
+    for node in doc.nodes() {
+        if name(node) != "upgrade" {
+            return Err(p.at(node, format!("upgrades.kdl only holds `upgrade` nodes, found `{}`", name(node))));
+        }
+        let id = p.id(node, "an upgrade id, like `upgrade \"polish\" { ... }`")?;
+        p.shape(node, 1, &[], true)?;
+        let (mut upgrade_name, mut max, mut bonuses) = (None, None, Vec::new());
+        for child in children(node) {
+            match name(child) {
+                "name" => upgrade_name = Some(p.str_arg(child, "a name for the item's lore, like \"Polish\"")?),
+                "max" => {
+                    p.shape(child, 1, &[], false)?;
+                    let value = p.whole(p.arg(child, 0, "a whole number")?)?;
+                    if value == 0 {
+                        return Err(p.at(child, "`max` must be at least 1"));
+                    }
+                    max = Some(value);
+                }
+                "bonus" => bonuses.push(p.upgrade_bonus(child, &mut stat_refs, &mut inherit_refs)?),
+                other => return Err(p.at(child, format!("unknown upgrade field `{other}` (expected name, max or bonus)"))),
+            }
+        }
+        let name_of = upgrade_name.ok_or_else(|| p.at(node, format!("upgrade `{id}` needs a `name`")))?;
+        let max = max.ok_or_else(|| p.at(node, format!("upgrade `{id}` needs a `max`")))?;
+        if bonuses.is_empty() {
+            return Err(p.at(node, format!("upgrade `{id}` needs a `bonus`, or it fits nothing")));
+        }
+        if upgrades.iter().any(|u| u.id == id) {
+            return Err(p.at(node, format!("upgrade `{id}` is defined twice")));
+        }
+        upgrades.push(UpgradeDef { id, name: name_of, color: "&7".to_string(), max, bonuses });
+    }
+    Ok((upgrades, stat_refs, inherit_refs))
+}
+
 /// Parses `stats_format.kdl`: one optional top-level `format`, then `stat`
 /// nodes in lore order. Also returns each stat with its "file:line:col", to
 /// check against the known stats once every item is loaded.
 pub fn parse_stat_formats(file: &str, src: &str) -> R<(StatFormats, Vec<(String, String)>)> {
-    let p = Parser { file, src, used_params: RefCell::default(), used_stats: RefCell::default(), used_kinds: RefCell::default() };
+    let p = Parser { file, src, used_params: RefCell::default(), used_stats: RefCell::default(), used_kinds: RefCell::default(), used_elements: RefCell::default(), loop_vars: RefCell::default() };
     let doc = p.document()?;
     let mut formats = StatFormats::default();
     let mut refs = Vec::new();
@@ -211,10 +320,11 @@ pub fn parse_stat_formats(file: &str, src: &str) -> R<(StatFormats, Vec<(String,
                 formats.format = p.stat_format(node)?;
             }
             "stat" => {
-                p.shape(node, 1, &[], true)?;
+                p.shape(node, 1, &["element"], true)?;
                 let entry = p.arg(node, 0, "a stat, like `stat \"magic-power\" { ... }`")?;
                 let stat = p.string(entry)?.replace('-', "_");
                 p.stat_name(entry, &stat)?;
+                let stat = stat_key(&stat, p.opt(node, "element", |e| p.string(e))?.as_deref());
                 if formats.stats.iter().any(|f| f.stat == stat) {
                     return Err(p.at(node, format!("stat `{stat}` is listed twice")));
                 }
@@ -245,7 +355,7 @@ pub fn parse_stat_formats(file: &str, src: &str) -> R<(StatFormats, Vec<(String,
 /// returns each `stat` with its "file:line:col", to check against the known
 /// stats once every item is loaded.
 pub fn parse_stats_layout(file: &str, src: &str) -> R<(Vec<LoreEntry>, Vec<(String, String)>)> {
-    let p = Parser { file, src, used_params: RefCell::default(), used_stats: RefCell::default(), used_kinds: RefCell::default() };
+    let p = Parser { file, src, used_params: RefCell::default(), used_stats: RefCell::default(), used_kinds: RefCell::default(), used_elements: RefCell::default(), loop_vars: RefCell::default() };
     let doc = p.document()?;
     let mut layout = Vec::new();
     let mut refs = Vec::new();
@@ -257,6 +367,7 @@ pub fn parse_stats_layout(file: &str, src: &str) -> R<(Vec<LoreEntry>, Vec<(Stri
             "stats" => LoreEntry::Stats,
             "skills" => LoreEntry::Skills,
             "sockets" => LoreEntry::Sockets,
+            "upgrades" => LoreEntry::Upgrades,
             "divider" => {
                 p.shape(node, 1, &["exists", "color", "fade"], false)?;
                 let divider = Divider {
@@ -268,15 +379,16 @@ pub fn parse_stats_layout(file: &str, src: &str) -> R<(Vec<LoreEntry>, Vec<(Stri
                 LoreEntry::Divider { divider, exists }
             }
             "stat" => {
-                p.shape(node, 1, &[], false)?;
+                p.shape(node, 1, &["element"], false)?;
                 let entry = p.arg(node, 0, "a stat, like `stat \"magic-power\"`")?;
                 let stat = p.string(entry)?.replace('-', "_");
                 p.stat_name(entry, &stat)?;
+                let stat = stat_key(&stat, p.opt(node, "element", |e| p.string(e))?.as_deref());
                 refs.push((stat.clone(), p.position(node)));
                 LoreEntry::Stat(stat)
             }
             other => {
-                return Err(p.at(node, format!("unknown lore entry `{other}` (expected rarity, lore, stat, stats, sockets, skills, divider or empty)")));
+                return Err(p.at(node, format!("unknown lore entry `{other}` (expected rarity, lore, stat, stats, sockets, upgrades, skills, divider or empty)")));
             }
         };
         if !matches!(entry, LoreEntry::Stat(_) | LoreEntry::Divider { .. }) {
@@ -292,7 +404,7 @@ pub fn parse_stats_layout(file: &str, src: &str) -> R<(Vec<LoreEntry>, Vec<(Stri
 
 /// Parses one file. A file may contain any number of `item` and `skill` nodes.
 pub fn parse_file(file: &str, src: &str) -> R<Parsed> {
-    let p = Parser { file, src, used_params: RefCell::default(), used_stats: RefCell::default(), used_kinds: RefCell::default() };
+    let p = Parser { file, src, used_params: RefCell::default(), used_stats: RefCell::default(), used_kinds: RefCell::default(), used_elements: RefCell::default(), loop_vars: RefCell::default() };
     let doc = p.document()?;
     let mut parsed = Parsed::default();
     for node in doc.nodes() {
@@ -324,6 +436,9 @@ pub fn parse_file(file: &str, src: &str) -> R<Parsed> {
     for (kind, offset) in p.used_kinds.borrow().iter() {
         parsed.kind_refs.push((kind.clone(), p.position_at(*offset)));
     }
+    for (element, offset) in p.used_elements.borrow().iter() {
+        parsed.element_refs.push((element.clone(), p.position_at(*offset)));
+    }
     Ok(parsed)
 }
 
@@ -336,6 +451,10 @@ struct Parser<'a> {
     used_stats: RefCell<Vec<(String, usize)>>,
     /// `kind="x"` used anywhere in the file, with their positions.
     used_kinds: RefCell<Vec<(String, usize)>>,
+    /// `damage ... element="x"` used in the file, with their positions.
+    used_elements: RefCell<Vec<(String, usize)>>,
+    /// `repeat var=` names in the skill being parsed, with their positions.
+    loop_vars: RefCell<Vec<(String, usize)>>,
 }
 
 fn name(node: &KdlNode) -> &str {
@@ -558,8 +677,9 @@ impl Parser<'_> {
             "lore" => Ok(LoreEntry::Lore),
             "stats" => Ok(LoreEntry::Stats),
             "sockets" => Ok(LoreEntry::Sockets),
+            "upgrades" => Ok(LoreEntry::Upgrades),
             "skills" => Ok(LoreEntry::Skills),
-            _ => Err(self.at_entry(entry, format!("unknown section `{text}` (expected rarity, lore, stats, sockets or skills)"))),
+            _ => Err(self.at_entry(entry, format!("unknown section `{text}` (expected rarity, lore, stats, sockets, upgrades or skills)"))),
         }
     }
 
@@ -575,8 +695,8 @@ impl Parser<'_> {
                 return Err(self.err(at, "`{` is never closed"));
             };
             let key = &rest[open + 1..open + close];
-            if !STAT_PLACEHOLDERS.contains(&key) {
-                return Err(self.err(at, format!("unknown placeholder `{{{key}}}` (expected {{name}}, {{sign}}, {{value}} or {{fill}})")));
+            if !STAT_PLACEHOLDERS.contains(&key) && !key.strip_prefix("color:").is_some_and(|c| !c.is_empty()) {
+                return Err(self.err(at, format!("unknown placeholder `{{{key}}}` (expected {{name}}, {{sign}}, {{value}}, {{fill}} or {{color:&a}})")));
             }
             rest = &rest[open + close + 1..];
         }
@@ -614,11 +734,13 @@ impl Parser<'_> {
         let mut stat_at = Vec::new();
         let mut uses = Vec::new();
         let (mut sockets, mut gem, mut reforgeable) = (Vec::new(), None, true);
+        let mut upgrade = None;
 
         for child in children(node) {
             match name(child) {
                 "sockets" => sockets = self.sockets(child)?,
                 "gem" => gem = Some(self.socket_type(self.arg(child, 0, "a socket type, like `gem \"red\"`")?)?),
+                "upgrade" => upgrade = Some(self.str_arg(child, "an upgrade from upgrades.kdl")?),
                 "reforgeable" => {
                     self.shape(child, 1, &[], false)?;
                     reforgeable = self.boolean(self.arg(child, 0, "#true or #false")?)?;
@@ -666,11 +788,30 @@ impl Parser<'_> {
             return Err(self.at(node, format!("item `{id}` is a gem, so it can't have sockets of its own")));
         }
 
+        if upgrade.is_some() {
+            let what = if gem.is_some() {
+                Some("be a gem")
+            } else if !sockets.is_empty() {
+                Some("have sockets")
+            } else if !stats.is_empty() {
+                Some("have stats (the upgrade's `bonus` holds them)")
+            } else if !uses.is_empty() {
+                Some("have skills")
+            } else {
+                None
+            };
+            if let Some(what) = what {
+                return Err(self.at(node, format!("item `{id}` is an upgrade item, so it can't {what}")));
+            }
+        }
+
         let item = ItemDef {
             sockets,
             gem,
             reforgeable,
+            upgrade,
             socket_views: Vec::new(),
+            upgrade_views: Vec::new(),
             name: item_name.ok_or_else(|| self.at(node, format!("item `{id}` needs a `name`")))?,
             base,
             id,
@@ -683,6 +824,65 @@ impl Parser<'_> {
             skills: Vec::new(),
         };
         Ok(ItemFile { item, rarity, uses, stat_at })
+    }
+
+    /// `slots "head" "chest"`.
+    fn slot_filter(&self, node: &KdlNode) -> R<Vec<Slot>> {
+        self.shape(node, usize::MAX, &[], false)?;
+        args(node)
+            .map(|entry| {
+                let value = self.string(entry)?;
+                Slot::parse(&value).ok_or_else(|| {
+                    self.at_entry(entry, format!("unknown slot `{value}` (expected mainhand, offhand, head, chest, legs or feet)"))
+                })
+            })
+            .collect()
+    }
+
+    /// `kinds "Sword" "Staff"`.
+    fn kind_filter(&self, node: &KdlNode) -> R<Vec<String>> {
+        self.shape(node, usize::MAX, &[], false)?;
+        args(node).map(|entry| self.string(entry)).collect()
+    }
+
+    /// `bonus { slots ...; kinds ...; stats { ... } }` in an upgrade.
+    fn upgrade_bonus(&self, node: &KdlNode, stat_refs: &mut Vec<(String, String)>, inherit_refs: &mut Vec<(String, String)>) -> R<forge::UpgradeBonus> {
+        self.shape(node, 0, &[], true)?;
+        let mut bonus = forge::UpgradeBonus::default();
+        let mut stats_node = None;
+        for child in children(node) {
+            match name(child) {
+                "slots" => bonus.slots.extend(self.slot_filter(child)?),
+                "kinds" => bonus.kinds.extend(self.kind_filter(child)?),
+                "stats" => {
+                    let (stats, at) = self.stats(child)?;
+                    stats_node = Some(child);
+                    for (key, value) in stats {
+                        match split_stat(&key) {
+                            (stat, Some(forge::INHERIT)) => bonus.inherited.insert(stat.to_string(), value),
+                            _ => bonus.stats.insert(key, value),
+                        };
+                    }
+                    for (key, position) in at {
+                        match split_stat(&key) {
+                            (stat, Some(forge::INHERIT)) => inherit_refs.push((stat.to_string(), position)),
+                            _ => stat_refs.push((key, position)),
+                        }
+                    }
+                }
+                other => return Err(self.at(child, format!("unknown bonus field `{other}` (expected slots, kinds or stats)"))),
+            }
+        }
+        let Some(stats_node) = stats_node.filter(|_| !bonus.stats.is_empty() || !bonus.inherited.is_empty()) else {
+            return Err(self.at(node, "a `bonus` needs `stats` with something in them"));
+        };
+        if !bonus.slots.is_empty()
+            && !bonus.slots.contains(&Slot::MainHand)
+            && let Some(stat) = bonus.stats.keys().chain(bonus.inherited.keys()).find(|s| stat_info(s).is_some_and(|i| i.main_hand_only))
+        {
+            return Err(self.at(stats_node, format!("`{}` only works on main-hand items, but `slots` leaves those out", stat.replace('_', "-"))));
+        }
+        Ok(bonus)
     }
 
     /// `sockets 2` or `sockets "red" "any"`.
@@ -713,7 +913,8 @@ impl Parser<'_> {
         Ok(())
     }
 
-    /// `stats { magic-power 50 }`, kebab-case or snake_case. Returns the
+    /// `stats { magic-power 50; damage 2 element="fire" }`, kebab-case or
+    /// snake_case. A stat can be listed once per element. Returns the
     /// stats and where each one is, so undeclared custom stats can be reported.
     fn stats(&self, node: &KdlNode) -> R<(Stats, Vec<(String, String)>)> {
         self.shape(node, 0, &[], true)?;
@@ -724,9 +925,15 @@ impl Parser<'_> {
             if !stat.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_') {
                 return Err(self.at(child, format!("stat `{}` may only use a-z, 0-9, - and _", name(child))));
             }
-            let value = self.num_arg(child, "a number")?;
+            self.shape(child, 1, &["element"], false)?;
+            let value = self.number(self.arg(child, 0, "a number")?)?;
+            let element = self.opt(child, "element", |e| self.string(e))?;
+            let stat = stat_key(&stat, element.as_deref());
             if stats.insert(stat.clone(), value).is_some() {
-                return Err(self.at(child, format!("stat `{}` is listed twice", name(child))));
+                return Err(self.at(child, match element {
+                    Some(element) => format!("stat `{}` with element `{element}` is listed twice", name(child)),
+                    None => format!("stat `{}` is listed twice", name(child)),
+                }));
             }
             at.push((stat, self.position(child)));
         }
@@ -793,6 +1000,7 @@ impl Parser<'_> {
     fn skill(&self, node: &KdlNode, id: String) -> R<SkillDef> {
         self.shape(node, 1, &[], true)?;
         self.used_params.borrow_mut().clear();
+        self.loop_vars.borrow_mut().clear();
         let mut trigger = None;
         let mut skill = SkillDef {
             name: id.clone(),
@@ -878,6 +1086,11 @@ impl Parser<'_> {
         skill.trigger = trigger.ok_or_else(|| self.at(node, format!("skill `{}` needs a `trigger`", skill.id)))?;
         skill.actions = Arc::new(actions);
 
+        for (var, offset) in self.loop_vars.borrow().iter() {
+            if skill.params.contains_key(var) {
+                return Err(self.err(*offset, format!("`repeat` var `{var}` has the same name as a `param`; rename one")));
+            }
+        }
         for (param, offset) in self.used_params.borrow().iter() {
             if !skill.params.contains_key(param) {
                 return Err(self.err(*offset, format!("`${param}` is not declared; add `param {param} <default>` to the skill")));
@@ -936,12 +1149,32 @@ impl Parser<'_> {
         let mechanic = match name(node) {
             "target" => return self.target(node, on_points),
             "repeat" => {
-                self.shape(node, 1, &["every"], true)?;
+                self.shape(node, 1, &["every", "var"], true)?;
                 let times = self.num(self.arg(node, 0, "a count, like `repeat 3 every=10 { ... }`")?)?;
+                let var = prop(node, "var")
+                    .map(|e| {
+                        let var = self.string(e)?;
+                        if var.is_empty() || !var.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                            return Err(self.at_entry(e, "`var=` takes a plain name, like var=\"i\" (used as `$i`)"));
+                        }
+                        self.loop_vars.borrow_mut().push((var.clone(), e.span().offset()));
+                        Ok(var)
+                    })
+                    .transpose()?;
+                // Uses of the var in `every` and the block are fine; anywhere
+                // else it stays an undeclared param.
+                let before = self.used_params.borrow().len();
                 let every = self.opt(node, "every", |e| self.ticks(e))?
                     .ok_or_else(|| self.at(node, "`repeat` needs `every=` (ticks)"))?;
                 let actions = self.actions(children(node), on_points)?;
-                return Ok(Action::Repeat { times, every, actions });
+                if let Some(var) = &var {
+                    let mut index = 0;
+                    self.used_params.borrow_mut().retain(|(param, _)| {
+                        index += 1;
+                        index <= before || param != var
+                    });
+                }
+                return Ok(Action::Repeat { times, every, var, actions });
             }
             "wait" => {
                 self.shape(node, 1, &[], false)?;
@@ -987,7 +1220,14 @@ impl Parser<'_> {
                 if let Some(old) = prop(node, "type") {
                     return Err(self.at_entry(old, "`type=` is now `source=` (the Minecraft damage type); for magic/physical damage use `kind=`"));
                 }
-                self.shape(node, 1, &["kind", "scale", "source", "triggers-hit"], false)?;
+                self.shape(node, 1, &["kind", "element", "scale", "source", "triggers-hit"], false)?;
+                let element = prop(node, "element")
+                    .map(|e| {
+                        let id = self.string(e)?;
+                        self.used_elements.borrow_mut().push((id.clone(), e.span().offset()));
+                        Ok(id)
+                    })
+                    .transpose()?;
                 let kind = prop(node, "kind")
                     .map(|e| {
                         let k = self.string(e)?;
@@ -1002,6 +1242,7 @@ impl Parser<'_> {
                 Mechanic::Damage {
                     amount: self.num(self.arg(node, 0, "an amount")?)?,
                     kind,
+                    element,
                     scale,
                     source: self.opt(node, "source", |e| self.string(e))?,
                     triggers_hit: self.opt(node, "triggers-hit", |e| self.boolean(e))?.unwrap_or(false),
@@ -1238,7 +1479,7 @@ mod tests {
         let slots: Vec<Slot> = armor.items.iter().map(|f| f.item.slot).collect();
         assert_eq!(slots, [Slot::Head, Slot::Chest, Slot::Legs, Slot::Feet, Slot::OffHand]);
         assert_eq!(armor.items[1].item.stats["magic_power"], 20.0);
-        // magic-power and magic-armor are declared by kinds.kdl (the loader
+        // magic-power and magic-defense are declared by kinds.kdl (the loader
         // adds each kind's power and defense stats).
         let kinds = parse_kinds("kinds.kdl", include_str!("../../examples/kinds.kdl")).unwrap();
         let declared = kinds.iter().flat_map(|k| k.power.iter().chain(&k.defense).cloned()).collect();
@@ -1253,12 +1494,12 @@ mod tests {
             DamageKind {
                 id: "magic".into(),
                 power: Some("magic_power".into()),
-                defense: Some("magic_armor".into()),
+                defense: Some("magic_defense".into()),
                 source: "magic".into(),
                 display: KindDisplay { prefix: "✦ ".into(), color: "&d".into() },
             }
         );
-        assert_eq!(kinds[0].defense, None);
+        assert_eq!(kinds[0].defense.as_deref(), Some("defense"));
         assert_eq!(kinds[0].power.as_deref(), Some("strength"));
 
         let parsed = parse_file("s", include_str!("../../examples/skills/storm.kdl")).unwrap();
@@ -1347,22 +1588,22 @@ mod tests {
 
     #[test]
     fn lore_entries() {
-        let src = "item \"a\" {\n  name \"A\"\n  kind \"Sword\"\n  base \"minecraft:stick\"\n  lore \"Old.\"\n  stats {\n    armor 2\n    health 4\n  }\n}";
+        let src = "item \"a\" {\n  name \"A\"\n  kind \"Sword\"\n  base \"minecraft:stick\"\n  lore \"Old.\"\n  stats {\n    defense 2\n    health 4\n  }\n}";
         let a = item(src);
         let lore = |file: &str| {
             let formats = StatFormats { layout: parse_stats_layout("f.kdl", file).unwrap().0, ..Default::default() };
             a.lore_lines(&PlayerStats::new(), &formats)
         };
         let default = a.lore_lines(&PlayerStats::new(), &StatFormats::default());
-        let (rarity, text, armor, health) = (default[0].as_str(), "&7&oOld.", "&7Armor &b+2", "&7Health &b+4");
+        let (rarity, text, defense, health) = (default[0].as_str(), "&7&oOld.", "&7Defense &b+2", "&7Health &b+4");
 
-        assert_eq!(default, [rarity, "", text, "", armor, health]);
+        assert_eq!(default, [rarity, "", text, "", defense, health]);
         // Blank lines are only where they are listed, even at the top or doubled.
-        assert_eq!(lore("stats\nrarity\nlore"), [armor, health, rarity, text]);
+        assert_eq!(lore("stats\nrarity\nlore"), [defense, health, rarity, text]);
         assert_eq!(lore("empty\nlore\nempty\nempty\nrarity"), ["", text, "", "", rarity]);
         // `stat` places one stat; `stats` is the rest.
-        assert_eq!(lore("stat \"health\"\nrarity\nstats"), [health, rarity, armor]);
-        assert_eq!(lore("stat \"health\"\nstat \"armor\""), [health, armor]);
+        assert_eq!(lore("stat \"health\"\nrarity\nstats"), [health, rarity, defense]);
+        assert_eq!(lore("stat \"health\"\nstat \"defense\""), [health, defense]);
         assert_eq!(lore("stat \"speed\"\nempty\nlore"), [text]);
         // No blank line around what this item does not have (no skills here).
         assert_eq!(lore("rarity\nempty\nskills\nempty\nlore"), [rarity, "", text]);
@@ -1376,7 +1617,7 @@ mod tests {
         assert!(e.starts_with("f.kdl:2:1: unknown lore entry `statz`"), "{e}");
         let e = parse_stats_layout("f.kdl", "lore\nlore").unwrap_err().to_string();
         assert!(e.contains("listed twice"), "{e}");
-        let e = parse_stats_layout("f.kdl", "stat \"armor\"\nstat \"armor\"").unwrap_err().to_string();
+        let e = parse_stats_layout("f.kdl", "stat \"defense\"\nstat \"defense\"").unwrap_err().to_string();
         assert!(e.contains("listed twice"), "{e}");
         let e = parse_stats_layout("f.kdl", "empty \"x\"").unwrap_err().to_string();
         assert!(e.contains("too many values"), "{e}");
@@ -1387,7 +1628,7 @@ mod tests {
 
     #[test]
     fn dividers_and_fill_line_up() {
-        let src = "item \"a\" {\n  name \"A rather long item name here\"\n  base \"minecraft:stick\"\n  stats {\n    armor 2\n    health 40\n    speed 12.5\n  }\n}";
+        let src = "item \"a\" {\n  name \"A rather long item name here\"\n  base \"minecraft:stick\"\n  stats {\n    defense 2\n    health 40\n    speed 12.5\n  }\n}";
         let a = item(src);
         let mut formats = parse_stat_formats("f.kdl", "format \"&7{name}{fill}&b{sign}{value}\"\nstat \"health\" {\n  format \"&c❤ &7{name}{fill}&c{sign}{value}\"\n}").unwrap().0;
         formats.layout = parse_stats_layout("f.kdl", "divider \"&fStats\" exists=stats\nstats\ndivider exists=stats\nempty\ndivider \"Gems\" exists=sockets\nsockets\nempty\nrarity").unwrap().0;
@@ -1403,7 +1644,7 @@ mod tests {
         assert!(lore.iter().all(|l| !l.contains(super::tooltip::FILL)), "{lore:?}");
 
         // A long stat line stretches the rest.
-        let long = item("item \"a\" {\n  name \"A\"\n  base \"minecraft:stick\"\n  stats {\n    armor 123456789012345678901234567890\n    health 4\n  }\n}");
+        let long = item("item \"a\" {\n  name \"A\"\n  base \"minecraft:stick\"\n  stats {\n    defense 123456789012345678901234567890\n    health 4\n  }\n}");
         let lore = long.lore_lines(&PlayerStats::new(), &formats);
         assert!(width(&lore[0]) > 150);
         assert_eq!(width(&lore[1]), width(&lore[0]), "{lore:?}");
@@ -1423,10 +1664,10 @@ mod tests {
 
     #[test]
     fn stat_formats() {
-        let src = "format \"{name}: {value}\"\nstat \"magic-power\" {\n  name \"Puissance\"\n  format \"&d{sign}{value} {name}\"\n}\nstat \"armor\" {\n  hidden #true\n}\nstat \"speed\"";
+        let src = "format \"{name}: {value}\"\nstat \"magic-power\" {\n  name \"Puissance\"\n  format \"&d{sign}{value} {name}\"\n}\nstat \"defense\" {\n  hidden #true\n}\nstat \"speed\"";
         let (formats, refs) = parse_stat_formats("f.kdl", src).unwrap();
         assert_eq!(refs[0], ("magic_power".to_string(), "f.kdl:2:1".to_string()));
-        let stats = Stats::from([("armor".into(), 5.0), ("speed".into(), -10.0), ("magic_power".into(), 20.0), ("luck".into(), 1.0)]);
+        let stats = Stats::from([("defense".into(), 5.0), ("speed".into(), -10.0), ("magic_power".into(), 20.0), ("luck".into(), 1.0)]);
         // Listed order, hidden left out, unlisted (luck) last with the default.
         assert_eq!(formats.lines(&stats), ["&d+20 Puissance", "Speed: -10", "Luck: 1"]);
 
@@ -1436,6 +1677,59 @@ mod tests {
         assert!(e.contains("unknown stat field `colour`"), "{e}");
         let e = parse_stat_formats("f.kdl", "stat \"damage\"\nstat \"damage\"").unwrap_err().to_string();
         assert!(e.contains("listed twice"), "{e}");
+    }
+
+    #[test]
+    fn repeat_var_grows_and_eases() {
+        let skills = parse_file("s", r#"skill "s" {
+    trigger "right_click"
+    repeat 7 every="1 + $i * $i / 4" var="i" {
+        target "arc" radius="1.5 + $i * $i * 0.2" points="9 + $i * 3" {
+            particle "flame" count=3 spread=0.03
+        }
+    }
+}"#).unwrap().skills;
+        let Action::Repeat { var, every, .. } = &skills[0].actions[0] else { panic!("{:?}", skills[0].actions) };
+        assert_eq!(var.as_deref(), Some("i"));
+        // Each gap is worked out from its own iteration number.
+        let gap = |i: f64| {
+            let params = Params::from([("i".to_string(), i)]);
+            every.get(Scope { params: &params, stats: &PlayerStats::new() })
+        };
+        assert_eq!((gap(0.0), gap(2.0), gap(4.0)), (1.0, 2.0, 5.0));
+
+        // Fixed gaps and no var still work.
+        let skills = parse_file("s", r#"skill "s" {
+    trigger "right_click"
+    repeat 3 every="1s" { heal 1 }
+}"#).unwrap().skills;
+        assert!(matches!(&skills[0].actions[0], Action::Repeat { var: None, every: Num::Lit(20.0), .. }));
+
+        // The var only exists inside its repeat.
+        let msg = err(r#"skill "s" {
+    trigger "right_click"
+    repeat 3 every=1 var="i" { heal 1 }
+    heal "$i"
+}"#);
+        assert!(msg.contains("`$i` is not declared"), "{msg}");
+        let msg = err(r#"skill "s" {
+    trigger "right_click"
+    repeat "$i" every=1 var="i" { heal 1 }
+}"#);
+        assert!(msg.contains("`$i` is not declared"), "{msg}");
+
+        // Bad names and clashes.
+        let msg = err(r#"skill "s" {
+    trigger "right_click"
+    repeat 3 every=1 var="$i" { heal 1 }
+}"#);
+        assert!(msg.contains("plain name"), "{msg}");
+        let msg = err(r#"skill "s" {
+    trigger "right_click"
+    repeat 3 every=1 var="i" { heal 1 }
+    param i 2
+}"#);
+        assert!(msg.contains("same name as a `param`"), "{msg}");
     }
 
     #[test]
@@ -1510,5 +1804,115 @@ mod tests {
   }
 }");
         assert!(e.contains("unknown projectile block `boom`"), "{e}");
+    }
+
+    #[test]
+    fn elements_file() {
+        let e = parse_elements("e", include_str!("../../examples/elements.kdl")).unwrap();
+        assert_eq!(e.multiplier("fire", "water"), 1.25, "own entry");
+        assert_eq!(e.multiplier("fire", "fire"), 0.7, "self default");
+        assert_eq!(e.default, 1.0);
+
+        let e = parse_elements("e", "element-defaults default=2 self=0.5\nelement \"a\" {\n  name \"A\"\n  multipliers {\n    \"a\" 0.9\n  }\n}\nelement \"b\" {\n  name \"B\"\n}").unwrap();
+        assert_eq!(e.multiplier("a", "a"), 0.9, "an entry beats self=");
+        assert_eq!(e.multiplier("b", "b"), 0.5);
+        assert_eq!(e.multiplier("a", "b"), 2.0);
+
+        let bad = |src: &str| parse_elements("e", src).unwrap_err().to_string();
+        assert!(bad("element \"a\" {\n  name \"A\"\n  multipliers {\n    \"watr\" 2\n  }\n}").contains("e:4:5: unknown element `watr`"));
+        assert!(bad("element \"a\" {\n  multipliers {\n  }\n}").contains("needs a `name`"));
+        assert!(bad("element-defaults self=-1").contains("can't be negative"));
+        assert!(bad("element-defaults\nelement-defaults").contains("set twice"));
+    }
+
+    #[test]
+    fn stats_with_elements() {
+        let sword = parse_file("t", "item \"a\" {\n  name \"A\"\n  base \"minecraft:iron_sword\"\n  stats {\n    damage 5\n    damage 2 element=\"fire\"\n    attack-speed 1.6\n  }\n}").unwrap();
+        let file = &sword.items[0];
+        assert_eq!(file.item.stats["damage"], 5.0);
+        assert_eq!(file.item.stats["damage.fire"], 2.0);
+        assert_eq!(stat_total(&file.item.stats, "damage"), 7.0);
+        assert!(check_stats(file, &Default::default()).is_empty(), "tagged built-ins need no declaring");
+
+        let e = err("item \"a\" {\n  name \"A\"\n  base \"x\"\n  stats {\n    damage 2 element=\"fire\"\n    damage 3 element=\"fire\"\n  }\n}");
+        assert!(e.contains("with element `fire` is listed twice"), "{e}");
+        let e = err("item \"a\" {\n  name \"A\"\n  base \"minecraft:iron_boots\"\n  stats {\n    damage 2 element=\"fire\"\n  }\n}");
+        assert!(e.contains("only works on main-hand items"), "{e}");
+
+        // Unknown elements and stats that mean nothing per element.
+        let elements = parse_elements("e", include_str!("../../examples/elements.kdl")).unwrap();
+        let taggable = ["damage".to_string(), "defense".to_string()].into();
+        let at = |key: &str| vec![(key.to_string(), "here".to_string())];
+        assert!(check_stat_elements(&at("damage.fire"), &taggable, &elements).is_empty());
+        assert!(check_stat_elements(&at("damage.fyre"), &taggable, &elements)[0].contains("unknown element `fyre`"));
+        assert!(check_stat_elements(&at("speed.fire"), &taggable, &elements)[0].contains("`speed` can't have an element"));
+
+        // Formulas read the tagged part on its own.
+        let parsed = parse_file("t", "skill \"s\" {\n  trigger \"hit\"\n  damage \"self.magic_power.fire * 2\" element=\"fire\" kind=\"magic\"\n}").unwrap();
+        assert!(parsed.stat_refs.iter().any(|(s, _)| s == "magic_power.fire"));
+        assert_eq!(parsed.element_refs[0].0, "fire");
+    }
+
+    #[test]
+    fn element_lore() {
+        let formats = |src: &str| {
+            let (mut f, _) = parse_stat_formats("f", src).unwrap();
+            f.element_names.insert("fire".into(), "Fire".into());
+            f
+        };
+        let stats = Stats::from([("damage".into(), 5.0), ("damage.fire".into(), 2.0), ("health".into(), 1.0)]);
+        // Follows its stat's name, format and place.
+        let f = formats("format \"{name} {value}\"\nstat \"health\"\nstat \"damage\" {\n  name \"Dmg\"\n  format \"!{name} {value}\"\n}");
+        assert_eq!(f.lines(&stats), ["health 1".replace("health", "Health"), "!Dmg 5".into(), "!Fire Dmg 2".into()]);
+        // The element's color only colors the name it adds.
+        let mut f = formats("format \"&7{name}{fill}&b{value}\"");
+        f.element_names.insert("fire".into(), "&cFire".into());
+        assert!(f.line("damage.fire", 2.0).unwrap().starts_with("&7&cFire Damage"));
+        assert!(f.line("damage.fire", 2.0).unwrap().ends_with("&b2"));
+        assert!(f.line("damage", 2.0).unwrap().starts_with("&7Damage"));
+        // `{color:...}`: the element's color on tagged stats, else the default.
+        let mut f = formats("stat \"defense\" {\n  format \"{color:&a}# &7{name} {color:&a}{value}\"\n}");
+        f.element_colors.insert("fire".into(), "&c".into());
+        f.element_colors.insert("plain".into(), String::new());
+        assert_eq!(f.line("defense", 2.0).unwrap(), "&a# &7Defense &a2");
+        assert_eq!(f.line("defense.fire", 2.0).unwrap(), "&c# &7Fire Defense &c2");
+        assert_eq!(f.line("defense.plain", 2.0).unwrap(), "&a# &7Plain Defense &a2", "no color falls back");
+        let e = parse_stat_formats("f", "format \"{color}x\"").unwrap_err().to_string();
+        assert!(e.contains("unknown placeholder `{color}`"), "{e}");
+        // Its own entry wins.
+        let f = formats("stat \"damage\"\nstat \"damage\" element=\"fire\" {\n  name \"Burn\"\n  format \"{name}!\"\n}");
+        assert_eq!(f.line("damage.fire", 2.0).unwrap(), "Burn!");
+        let f = formats("stat \"damage\" {\n  hidden #true\n}");
+        assert_eq!(f.line("damage.fire", 2.0), None, "hidden with its stat");
+    }
+
+    #[test]
+    fn element_multipliers() {
+        let e = parse_elements("e", "element-defaults default=1.0 self=0.7\nelement \"fire\" {\n  name \"Fire\"\n  multipliers {\n    \"water\" 1.25\n  }\n}\nelement \"water\" {\n  name \"Water\"\n}").unwrap();
+        let defense = |s: &str| s == "defense" || s == "magic_defense";
+        let target = Stats::from([("magic_defense.water".into(), 10.0), ("defense".into(), 10.0), ("max_mana".into(), 100.0)]);
+
+        // A mix by amount, with untagged defense neutral; other stats don't count.
+        assert!((e.against(Some("fire"), &target, &defense) - 1.125).abs() < 1e-9);
+        // Neutral attacks and targets without defense are always 1x.
+        assert_eq!(e.against(None, &target, &defense), 1.0);
+        assert_eq!(e.against(Some("fire"), &Stats::new(), &defense), 1.0);
+        // All water.
+        let water = Stats::from([("defense.water".into(), 5.0)]);
+        assert_eq!(e.against(Some("fire"), &water, &defense), 1.25);
+        assert_eq!(e.against(Some("water"), &water, &defense), 0.7);
+
+        // Melee: `damage 5` + `damage 2 element="fire"` against all water.
+        let sword = Stats::from([("damage".into(), 5.0), ("damage.fire".into(), 2.0), ("attack_speed".into(), 1.6)]);
+        assert!((e.melee(&sword, &water, &defense) - (5.0 + 2.0 * 1.25) / 7.0).abs() < 1e-9);
+        // Icons on damage numbers: biggest part first, skipping elements without one.
+        let e2 = parse_elements("e", "element \"a\" {\n  name \"A\"\n  color \"&c\"\n  icon \"X\"\n}\nelement \"b\" {\n  name \"B\"\n  icon \"Y\"\n}\nelement \"c\" {\n  name \"C\"\n  color \"&1\"\n}").unwrap();
+        let weapon = Stats::from([("damage".into(), 9.0), ("damage.a".into(), 1.0), ("damage.b".into(), 3.0), ("damage.c".into(), 2.0), ("defense.a".into(), 50.0)]);
+        let hit = damage_elements(&weapon);
+        assert_eq!(hit, ["b", "c", "a"]);
+        assert_eq!(e2.icons(&hit), "Y &cX ");
+        assert_eq!(e2.icons(&[]), "");
+        // No stat means a plain hit.
+        assert_eq!(e.melee(&Stats::new(), &water, &defense), 1.0);
     }
 }

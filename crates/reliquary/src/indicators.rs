@@ -39,6 +39,8 @@ struct Pending {
 static PENDING: Mutex<Vec<Pending>> = Mutex::new(Vec::new());
 /// Entities a player damaged this tick -> the damage kind, if a skill set one.
 static BY_PLAYER: Mutex<Option<HashMap<u32, Option<String>>>> = Mutex::new(None);
+/// Entities hit this tick -> the elements of those hits, for their icons.
+static HIT_ELEMENTS: Mutex<Option<HashMap<u32, Vec<String>>>> = Mutex::new(None);
 static FLUSH_SCHEDULED: AtomicBool = AtomicBool::new(false);
 
 /// Marks that a player damaged `entity` (with a skill's damage `kind`, if
@@ -51,8 +53,26 @@ pub fn note_player_damage(entity: u32, kind: Option<&str>) {
     }
 }
 
+/// Marks the elements of a hit on `entity`, so its number shows their icons.
+pub fn note_elements(entity: u32, elements: Vec<String>) {
+    let mut map = HIT_ELEMENTS.lock().unwrap();
+    let entry = map.get_or_insert_with(HashMap::new).entry(entity).or_default();
+    for element in elements {
+        if !entry.contains(&element) {
+            entry.push(element);
+        }
+    }
+}
+
+/// The damage type of the hit `entity` is taking right now, as a name like
+/// "player_attack". `EntityDamageByEntityEvent` runs right after the
+/// `EntityDamageEvent` recorded here, and only has an unparseable cause itself.
+pub fn current_source(entity: u32) -> Option<String> {
+    PENDING.lock().unwrap().iter().rev().find(|hit| hit.id == entity).map(|hit| source_name(hit.kind))
+}
+
 /// An entity within `RANGE` of some player, and whether it is a player.
-fn find(server: &Server, id: u32) -> Option<(Entity, bool)> {
+pub fn find(server: &Server, id: u32) -> Option<(Entity, bool)> {
     for player in server.get_all_players() {
         let me = player.as_entity();
         if me.get_id() == id {
@@ -129,12 +149,16 @@ fn flush(server: &Server) {
     FLUSH_SCHEDULED.store(false, Ordering::Relaxed);
     let pending = std::mem::take(&mut *PENDING.lock().unwrap());
     let by_player = BY_PLAYER.lock().unwrap().take().unwrap_or_default();
+    let hit_elements = HIT_ELEMENTS.lock().unwrap().take().unwrap_or_default();
+    let elements = crate::game::elements();
     for hit in pending {
         let by = by_player.get(&hit.id);
         if !hit.target_is_player && by.is_none() {
             continue;
         }
-        let style = style(by.and_then(|k| k.as_deref()), hit.kind);
+        let (prefix, color) = style(by.and_then(|k| k.as_deref()), hit.kind);
+        let icons = hit_elements.get(&hit.id).map_or_else(String::new, |ids| elements.icons(ids));
+        let style = (format!("{icons}{color}{prefix}"), color);
         let Some((entity, _)) = find(server, hit.id) else { continue };
         let lost = match entity.as_living() {
             Some(l) if !l.is_dead() => hit.health_before - l.get_health(),

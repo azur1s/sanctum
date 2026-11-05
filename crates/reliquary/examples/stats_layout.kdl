@@ -8,6 +8,7 @@
 //         stats_format.kdl.
 // stats   Every stat not placed with `stat`, in stats_format.kdl's order.
 //         Includes what reforges and gems add.
+// upgrades The item's upgrades and how far along they are, like "Polish 7/10".
 // sockets The item's sockets and the gems in them.
 // skills  The item's skills, in the order the item lists them.
 // empty   A blank line. Dropped when what it separates is missing from an
@@ -15,12 +16,15 @@
 // divider A line across the tooltip that fades out at both ends, stretched to
 //         the width of the widest line. Text is optional and goes in the middle.
 //           exists=sockets  Only if the item has any. Also takes rarity, lore,
-//                           stats or skills.
+//                           stats, upgrades or skills.
 //           color="#7a6a9e" The line's color in the middle.
 //           fade="#241a33"  Its color at the ends.
 
 empty
 stats
+
+empty
+upgrades
 
 empty
 divider "&fGems" exists=sockets

@@ -6,9 +6,9 @@
 //         can use it in `stats { }` and formulas as `self.<stat>` without a
 //         separate `stat "..."` line.
 // defense The target's stat that reduces this kind: damage × 100 / (100 + defense),
-//         so 100 defense halves it. Also counts as declared. Only players have
-//         stats, so mobs have 0.
-// source  The Minecraft damage type used for the hit: decides vanilla armor,
+//         so 100 defense halves it. Also counts as declared. Mobs only have the
+//         stats of relics they are wearing.
+// source  The Minecraft damage type used for the hit: decides death messages
 //         death messages and so on. A `damage` line can override it with `source=`.
 //         Damage that is not from a skill (melee, ...) counts as the kind
 //         whose source matches, for damage numbers.
@@ -16,12 +16,13 @@
 //         number (an icon from a resource pack font works too), `color` is
 //         the number's color codes.
 //
-// Physical has no `defense`: vanilla armor already reduces `player_attack`
-// damage, and a defense stat on top would count armor twice.
+// Hits from another entity (melee, mobs, arrows, ...) on a player use the kind
+// whose source matches, or plain `defense` when none does.
 
 kind "physical" {
     power "strength"
-    source "player_attack" // armor applies
+    defense "defense"
+    source "player_attack"
     display {
         prefix "⚔ "
         color "&c"
@@ -30,8 +31,8 @@ kind "physical" {
 
 kind "magic" {
     power "magic-power"
-    defense "magic-armor"
-    source "magic" // vanilla magic: ignores vanilla armor
+    defense "magic-defense"
+    source "magic"
     display {
         prefix "✦ "
         color "&d"

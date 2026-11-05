@@ -123,6 +123,11 @@ pub(super) fn min_line_width(line: &str) -> u32 {
     text_width(line) + if line.contains(FILL) { MIN_FILL } else { 0 }
 }
 
+/// The pixels `line` leaves free in a tooltip of the smallest width.
+pub(super) fn room_left(line: &str) -> u32 {
+    MIN_WIDTH.saturating_sub(min_line_width(line))
+}
+
 /// How wide a tooltip has to be for these line widths.
 pub(super) fn tooltip_width(widths: impl IntoIterator<Item = u32>) -> u32 {
     widths.into_iter().fold(MIN_WIDTH, u32::max)

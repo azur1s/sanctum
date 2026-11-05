@@ -16,8 +16,8 @@ mod kdl;
 mod tooltip;
 
 pub use expr::{Expr, Params, PlayerStats, Scope};
-pub use forge::{Instance, ReforgeDef, Reforges, SocketView};
-pub use kdl::{parse_file, parse_kinds, parse_rarities, parse_reforges, parse_stat_formats, parse_stats_layout};
+pub use forge::{link_upgrades, Instance, ReforgeDef, Reforges, SocketView, UpgradeDef, UpgradeView, Upgrades};
+pub use kdl::{parse_elements, parse_file, parse_kinds, parse_rarities, parse_reforges, parse_stat_formats, parse_stats_layout, parse_upgrades};
 pub use tooltip::{Divider, Rgb};
 
 // ---- Items ----------------------------------------------------------------------
@@ -46,8 +46,12 @@ pub struct ItemDef {
     pub gem: Option<String>,
     /// `reforgeable #false` keeps reforges off this item.
     pub reforgeable: bool,
+    /// Set on upgrade items: the upgrade in `upgrades.kdl` it applies.
+    pub upgrade: Option<String>,
     /// Filled in by `with_instance`, for the lore.
     pub socket_views: Vec<SocketView>,
+    /// Filled in by `with_instance`, for the lore.
+    pub upgrade_views: Vec<UpgradeView>,
 }
 
 pub type Stats = BTreeMap<String, f64>;
@@ -106,7 +110,7 @@ pub const BUILTIN_STATS: &[StatInfo] = &[
     StatInfo { name: "damage", main_hand_only: true },
     StatInfo { name: "attack_speed", main_hand_only: true },
     StatInfo { name: "health", main_hand_only: false },
-    StatInfo { name: "armor", main_hand_only: false },
+    StatInfo { name: "defense", main_hand_only: false },
     StatInfo { name: "armor_toughness", main_hand_only: false },
     StatInfo { name: "speed", main_hand_only: false },
     StatInfo { name: "max_mana", main_hand_only: false },
@@ -114,7 +118,31 @@ pub const BUILTIN_STATS: &[StatInfo] = &[
 ];
 
 pub fn stat_info(name: &str) -> Option<&'static StatInfo> {
-    BUILTIN_STATS.iter().find(|s| s.name == name)
+    let (base, _) = split_stat(name);
+    BUILTIN_STATS.iter().find(|s| s.name == base)
+}
+
+/// How a stat is stored: "damage", or "damage.fire" for `damage 2 element="fire"`.
+/// Keeping the element in the key means reforges, gems and equipment add up
+/// tagged stats like any other, and formulas read them as `self.damage.fire`.
+pub fn stat_key(stat: &str, element: Option<&str>) -> String {
+    match element {
+        Some(element) => format!("{stat}.{element}"),
+        None => stat.to_string(),
+    }
+}
+
+/// "damage.fire" -> ("damage", Some("fire")).
+pub fn split_stat(key: &str) -> (&str, Option<&str>) {
+    match key.split_once('.') {
+        Some((stat, element)) => (stat, Some(element)),
+        None => (key, None),
+    }
+}
+
+/// A stat's amount with and without elements, like `damage` + `damage.fire`.
+pub fn stat_total(stats: &Stats, stat: &str) -> f64 {
+    stats.iter().filter(|(key, _)| split_stat(key).0 == stat).map(|(_, value)| value).sum()
 }
 
 /// "magic_power" -> "Magic Power".
@@ -137,6 +165,11 @@ pub struct StatFormats {
     pub stats: Vec<StatFormat>,
     /// What the lore shows in order, from `stats_layout.kdl`.
     pub layout: Vec<LoreEntry>,
+    /// Element id -> name with its color codes, for stat names like "&cFire
+    /// Damage". From `elements.kdl`.
+    pub element_names: BTreeMap<String, String>,
+    /// Element id -> color codes, for `{color:...}`. From `elements.kdl`.
+    pub element_colors: BTreeMap<String, String>,
 }
 
 /// A line or section of item lore.
@@ -152,6 +185,8 @@ pub enum LoreEntry {
     Skills,
     /// The item's sockets and what is in them.
     Sockets,
+    /// The item's upgrades and how far along they are.
+    Upgrades,
     /// A line across the tooltip, if `exists` has something to show (or always
     /// without one).
     Divider { divider: Divider, exists: Option<Box<LoreEntry>> },
@@ -159,7 +194,7 @@ pub enum LoreEntry {
 
 impl LoreEntry {
     fn default_layout() -> Vec<Self> {
-        vec![Self::Rarity, Self::Empty, Self::Lore, Self::Empty, Self::Stats, Self::Empty, Self::Sockets, Self::Empty, Self::Skills]
+        vec![Self::Rarity, Self::Empty, Self::Lore, Self::Empty, Self::Stats, Self::Empty, Self::Upgrades, Self::Empty, Self::Sockets, Self::Empty, Self::Skills]
     }
 }
 
@@ -177,9 +212,24 @@ pub struct StatFormat {
 /// Placeholders a stat format may use.
 pub const STAT_PLACEHOLDERS: &[&str] = &["name", "sign", "value", "fill"];
 
+/// Fills in `{color:&a}`: the element's color for a tagged stat, else `&a`.
+fn fill_color(format: &str, element_color: Option<&str>) -> String {
+    let mut out = String::new();
+    let mut rest = format;
+    while let Some(open) = rest.find("{color:") {
+        let Some(close) = rest[open..].find('}') else { break };
+        let default = &rest[open + "{color:".len()..open + close];
+        out.push_str(&rest[..open]);
+        out.push_str(element_color.unwrap_or(default));
+        rest = &rest[open + close + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
 impl Default for StatFormats {
     fn default() -> Self {
-        StatFormats { format: "&7{name} &b{sign}{value}".into(), stats: Vec::new(), layout: LoreEntry::default_layout() }
+        StatFormats { format: "&7{name} &b{sign}{value}".into(), stats: Vec::new(), layout: LoreEntry::default_layout(), element_names: BTreeMap::new(), element_colors: BTreeMap::new() }
     }
 }
 
@@ -193,20 +243,33 @@ impl StatFormats {
             .map(|(stat, &value)| (stat, value))
             .collect();
         // Stable, so unlisted stats keep their by-name order.
-        shown.sort_by_key(|(stat, _)| self.stats.iter().position(|f| &f.stat == *stat).unwrap_or(usize::MAX));
+        // A tagged stat without its own entry goes with its stat ("damage.fire"
+        // sorts right after "damage").
+        let position = |stat: &str| self.stats.iter().position(|f| f.stat == stat);
+        shown.sort_by_key(|(stat, _)| position(stat).or_else(|| position(split_stat(stat).0)).unwrap_or(usize::MAX));
         shown.into_iter().filter_map(|(stat, value)| self.line(stat, value)).collect()
     }
 
     /// The lore line for one stat; None if it is hidden.
     pub fn line(&self, stat: &str, value: f64) -> Option<String> {
+        let (base, element) = split_stat(stat);
         let own = self.stats.iter().find(|f| f.stat == stat);
-        if own.is_some_and(|f| f.hidden) {
+        // "damage.fire" looks like "damage" unless it has its own entry.
+        let parent = self.stats.iter().find(|f| f.stat == base);
+        if own.or(parent).is_some_and(|f| f.hidden) {
             return None;
         }
-        let name = own.and_then(|f| f.name.clone()).unwrap_or_else(|| stat_label(stat));
+        let base_name = || parent.and_then(|f| f.name.clone()).unwrap_or_else(|| stat_label(base));
+        let name = own.and_then(|f| f.name.clone()).unwrap_or_else(|| match element {
+            Some(id) => format!("{} {}", self.element_names.get(id).cloned().unwrap_or_else(|| stat_label(id)), base_name()),
+            None => base_name(),
+        });
+        let format = own.and_then(|f| f.format.as_deref())
+            .or_else(|| parent.and_then(|f| f.format.as_deref()))
+            .unwrap_or(&self.format);
+        let color = element.and_then(|id| self.element_colors.get(id)).map(String::as_str).filter(|c| !c.is_empty());
         Some(
-            own.and_then(|f| f.format.as_deref())
-                .unwrap_or(&self.format)
+            fill_color(format, color)
                 .replace("{name}", &name)
                 .replace("{sign}", if value >= 0.0 { "+" } else { "" })
                 .replace("{value}", &expr::format_number(value))
@@ -338,7 +401,10 @@ pub enum Action {
     },
     /// Runs `actions` now, then again every `every` ticks, `times` in total.
     /// Does not block: the actions after it run right away.
-    Repeat { times: Num, every: Num, actions: Actions },
+    /// `var` names a param holding the iteration number, from 0, inside
+    /// `actions` and `every`. `every` is worked out again for each gap, so the
+    /// gap after iteration 2 sees `$i` = 2.
+    Repeat { times: Num, every: Num, var: Option<String>, actions: Actions },
     /// Pauses this action list for some ticks.
     Wait(Num),
     /// A bolt from the caster's eyes along where it looks, moving `speed`
@@ -411,7 +477,9 @@ pub enum Mechanic {
     /// damage type; when missing, the kind's source (or "generic") is used.
     /// `triggers_hit` also runs the holder's `hit` skills on the target, like a
     /// melee hit (but not from inside a skill that was itself started that way).
-    Damage { amount: Num, kind: Option<String>, scale: Num, source: Option<String>, triggers_hit: bool },
+    /// `element` also adds `<power stat>.<element>` to the scaling and uses
+    /// `elements.kdl` against the target.
+    Damage { amount: Num, kind: Option<String>, element: Option<String>, scale: Num, source: Option<String>, triggers_hit: bool },
     Heal { amount: Num },
     Ignite { seconds: Num },
     /// Pushes the subject away from the caster.
@@ -461,6 +529,140 @@ impl Mechanic {
     }
 }
 
+// ---- Elements -----------------------------------------------------------------------
+
+/// One element from `elements.kdl`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ElementDef {
+    pub id: String,
+    /// Shown in stat names, like "Fire" in "Fire Damage".
+    pub name: String,
+    /// Legacy color codes for the name and icon, like "&c". May be empty.
+    pub color: String,
+    /// Shown on damage numbers of this element. May be empty.
+    pub icon: String,
+    /// Target element -> damage multiplier, when the file sets one.
+    pub multipliers: BTreeMap<String, f64>,
+}
+
+/// `elements.kdl`: how much damage each element deals to each other.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Elements {
+    /// Against a different element the attacker has no entry for.
+    pub default: f64,
+    /// Against the same element, when the attacker has no entry for it.
+    pub same: f64,
+    pub elements: BTreeMap<String, ElementDef>,
+}
+
+impl Default for Elements {
+    fn default() -> Self {
+        Elements { default: 1.0, same: 1.0, elements: BTreeMap::new() }
+    }
+}
+
+impl Elements {
+    /// One element against another. An element's own entry beats the defaults.
+    pub fn multiplier(&self, attack: &str, target: &str) -> f64 {
+        self.elements
+            .get(attack)
+            .and_then(|def| def.multipliers.get(target))
+            .copied()
+            .unwrap_or(if attack == target { self.same } else { self.default })
+    }
+
+    /// What goes before a damage number for these elements: each icon in its
+    /// color, then a space. Elements without an icon are skipped.
+    pub fn icons(&self, ids: &[String]) -> String {
+        ids.iter()
+            .filter_map(|id| self.elements.get(id))
+            .filter(|def| !def.icon.is_empty())
+            .map(|def| format!("{}{} ", def.color, def.icon))
+            .collect()
+    }
+
+    /// An attack against a target's defense stats. The target's element is a
+    /// mix weighted by amount, with untagged defense counting as neutral (1x).
+    /// Neutral attacks and targets without defense are always 1x.
+    pub fn against(&self, attack: Option<&str>, target: &Stats, is_defense: &dyn Fn(&str) -> bool) -> f64 {
+        let Some(attack) = attack else { return 1.0 };
+        let (mut weight, mut sum) = (0.0, 0.0);
+        for (key, &value) in target {
+            let (stat, element) = split_stat(key);
+            if is_defense(stat) {
+                let amount = value.max(0.0);
+                weight += amount;
+                sum += amount * element.map_or(1.0, |e| self.multiplier(attack, e));
+            }
+        }
+        if weight > 0.0 { sum / weight } else { 1.0 }
+    }
+
+    /// A melee hit: each part of the weapon's `damage` against the target, by
+    /// its share of the weapon's total. `damage 5` + `damage 2 element="fire"`
+    /// against a target that takes 1.25x from fire is 5/7 + 2/7 × 1.25.
+    pub fn melee(&self, attacker: &Stats, target: &Stats, is_defense: &dyn Fn(&str) -> bool) -> f64 {
+        let (mut weight, mut sum) = (0.0, 0.0);
+        for (key, &value) in attacker {
+            let (stat, element) = split_stat(key);
+            if stat == "damage" {
+                let amount = value.max(0.0);
+                weight += amount;
+                sum += amount * self.against(element, target, is_defense);
+            }
+        }
+        if weight > 0.0 { sum / weight } else { 1.0 }
+    }
+}
+
+/// The elements in a weapon's `damage`, biggest part first.
+pub fn damage_elements(stats: &Stats) -> Vec<String> {
+    let mut parts: Vec<(&str, f64)> = stats
+        .iter()
+        .filter_map(|(key, &value)| match split_stat(key) {
+            ("damage", Some(element)) if value > 0.0 => Some((element, value)),
+            _ => None,
+        })
+        .collect();
+    parts.sort_by(|a, b| b.1.total_cmp(&a.1));
+    parts.into_iter().map(|(element, _)| element.to_string()).collect()
+}
+
+/// `defense 1 element="inherit"` needs a stat that means something per element.
+/// `stat_at` holds plain stat names.
+pub fn check_inherited_stats(stat_at: &[(String, String)], taggable: &std::collections::BTreeSet<String>) -> Vec<String> {
+    stat_at
+        .iter()
+        .filter(|(stat, _)| !taggable.contains(stat))
+        .map(|(stat, at)| {
+            let list: Vec<&str> = taggable.iter().map(String::as_str).collect();
+            format!("{at}: stat `{stat}` can't inherit an element (only: {})", list.join(", "))
+        })
+        .collect()
+}
+
+/// `damage 2 element="fire"` needs an element that exists, on a stat that means
+/// something per element.
+pub fn check_stat_elements(
+    stat_at: &[(String, String)],
+    taggable: &std::collections::BTreeSet<String>,
+    elements: &Elements,
+) -> Vec<String> {
+    let mut problems = Vec::new();
+    for (key, at) in stat_at {
+        let (stat, Some(element)) = split_stat(key) else { continue };
+        if !taggable.contains(stat) {
+            let list: Vec<&str> = taggable.iter().map(String::as_str).collect();
+            problems.push(format!("{at}: stat `{stat}` can't have an element (only: {})", list.join(", ")));
+        }
+        if !elements.elements.contains_key(element) {
+            let list: Vec<&str> = elements.elements.keys().map(String::as_str).collect();
+            problems.push(format!("{at}: unknown element `{element}` (elements.kdl has: {})", list.join(", ")));
+        }
+    }
+    problems
+}
+
 // ---- Damage kinds -------------------------------------------------------------------
 
 /// A damage kind from `kinds.kdl`, e.g. magic or physical.
@@ -472,7 +674,7 @@ pub struct DamageKind {
     /// Minecraft damage type, like "magic" (ignores armor) or "player_attack".
     pub source: String,
     /// Stat (snake_case) of the target that reduces this damage, like
-    /// "magic_armor": damage × 100 / (100 + defense).
+    /// "magic_defense": damage × 100 / (100 + defense).
     pub defense: Option<String>,
     /// How damage numbers of this kind look.
     pub display: KindDisplay,
@@ -530,7 +732,7 @@ pub fn check_stats(file: &ItemFile, declared: &std::collections::BTreeSet<String
 pub fn check_stat_names(stat_at: &[(String, String)], declared: &std::collections::BTreeSet<String>) -> Vec<String> {
     stat_at
         .iter()
-        .filter(|(stat, _)| stat_info(stat).is_none() && !declared.contains(stat))
+        .filter(|(stat, _)| stat_info(stat).is_none() && !declared.contains(split_stat(stat).0))
         .map(|(stat, at)| {
             let builtin: Vec<&str> = BUILTIN_STATS.iter().map(|s| s.name).collect();
             format!(
@@ -715,6 +917,11 @@ pub fn cooldown_group(item: &ItemDef, skill_index: usize) -> String {
 }
 
 impl ItemDef {
+    /// Gems and upgrade items do nothing on their own: they go into other items.
+    pub fn is_relic(&self) -> bool {
+        self.gem.is_none() && self.upgrade.is_none()
+    }
+
     /// Display name with legacy color codes.
     pub fn display_name(&self) -> String {
         format!("{}{}", self.rarity.color, self.name)
@@ -778,6 +985,7 @@ impl ItemDef {
             LoreEntry::Stats => formats.lines(&self.stats),
             LoreEntry::Skills => self.skill_lines(stats),
             LoreEntry::Sockets => self.socket_lines(),
+            LoreEntry::Upgrades => self.upgrade_lines(),
         }
     }
 

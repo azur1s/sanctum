@@ -4,7 +4,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 
-use pumpkin_plugin_api::{ItemStack, Player, common::Hand};
+use pumpkin_plugin_api::{Entity, ItemStack, Player, Server, common::Hand, world::EquipmentSlot};
 
 use crate::game;
 use crate::items::{ItemDef, PlayerStats, Slot};
@@ -52,6 +52,38 @@ pub fn current(player: &Player) -> PlayerStats {
         }
     }
     total
+}
+
+/// What a mob's gear adds up to: each relic must be in the slot it is made for,
+/// like on a player. Mobs have no base stats.
+fn of_mob(entity: &Entity) -> PlayerStats {
+    let mut total = PlayerStats::new();
+    let Some(living) = entity.as_living() else { return total };
+    let slots = [
+        (Slot::MainHand, EquipmentSlot::MainHand),
+        (Slot::OffHand, EquipmentSlot::OffHand),
+        (Slot::Head, EquipmentSlot::Head),
+        (Slot::Chest, EquipmentSlot::Chest),
+        (Slot::Legs, EquipmentSlot::Legs),
+        (Slot::Feet, EquipmentSlot::Feet),
+    ];
+    for (slot, equipment) in slots {
+        if let Some(def) = relic(living.get_equipment(equipment)).filter(|def| def.slot == slot) {
+            for (stat, value) in &def.stats {
+                *total.entry(stat.clone()).or_insert(0.0) += value;
+            }
+        }
+    }
+    total
+}
+
+/// The stats of anything that can be hit. All damage looks stats up here.
+pub fn of_entity(server: &Server, entity: &Entity) -> PlayerStats {
+    let id = entity.get_id();
+    match server.get_all_players().into_iter().find(|p| p.as_entity().get_id() == id) {
+        Some(player) => current(&player),
+        None => of_mob(entity),
+    }
 }
 
 /// Stats plus live values for skills: `self.mana`, `self.hp`, `self.max_hp`.

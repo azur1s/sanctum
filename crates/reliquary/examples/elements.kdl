@@ -1,0 +1,59 @@
+// Elements. Damage and defense stats can be tagged with one:
+//
+//     stats {
+//         damage 5
+//         damage 2 element="fire"        // 7 damage in total, 2 of it fire
+//         magic-defense 10 element="fire"
+//     }
+//
+// `element=` works on `damage`, `defense` and the power and defense stats of
+// kinds.kdl. Gems and reforges can use it too. Skills pick theirs per hit:
+//
+//     damage 10 kind="magic" scale=0.25 element="fire"
+//
+// That hit scales with magic-power plus magic-power tagged "fire"; other tagged
+// power does not count. Formulas read the tagged part as self.magic_power.fire
+// (self.magic_power is the untagged part).
+//
+// A melee hit is split by the weapon's damage: `damage 5` + `damage 2 element="fire"`
+// is 5/7 neutral and 2/7 fire, each with its own multiplier.
+//
+// A target's element comes from its defense stats, weighted by amount.
+// Untagged defense counts as neutral. All tagged defense still protects against
+// everything; the element only changes the multiplier below. Take 10 fire and
+// 10 untagged magic defense, hit by water: (1.25 + 1.0) / 2 = 1.125x.
+//
+// Mobs only have the stats of relics they are wearing (`/relic equip <id>`), so
+// other mobs are neutral. Neutral attacks and neutral targets always deal 1x,
+// whatever these say.
+//
+// default  Against a different element with no entry below.
+// self     Against the same element with no entry below.
+//
+// name         Shown in stat names, like "Fire Damage". Their look comes from
+//              stats_format.kdl (`stat "damage" element="fire"` to change one).
+// color        Color codes for that name and for the icon. Optional.
+// icon         Shown on damage numbers of this element, before the number. An
+//              icon from a resource pack font works too. Optional. A weapon
+//              with several elements shows all of theirs.
+// multipliers  Target element -> damage multiplier. Beats the defaults.
+
+element-defaults default=1.0 self=0.7
+
+element "fire" {
+    name "Fire"
+    color "&c"
+    icon "☄"
+    multipliers {
+        "water" 1.25
+    }
+}
+
+element "water" {
+    name "Water"
+    color "&9"
+    icon "☂"
+    multipliers {
+        "fire" 1.25
+    }
+}

@@ -225,6 +225,14 @@ impl P {
             if stat.is_empty() {
                 return Err(self.error("expected a stat name after `self.`"));
             }
+            // `self.damage.fire`: the part of a stat tagged with an element.
+            if self.eat('.') {
+                let element = self.ident();
+                if element.is_empty() {
+                    return Err(self.error("expected an element after the stat, like self.magic_power.fire"));
+                }
+                return Ok(Expr::Stat(format!("{stat}.{element}")));
+            }
             return Ok(Expr::Stat(stat));
         }
         let (func, arity) = match name.as_str() {

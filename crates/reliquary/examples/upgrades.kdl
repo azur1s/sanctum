@@ -1,0 +1,43 @@
+// Upgrades. Unlike a reforge, these stack up on an item, up to `max`.
+//
+// An item with an `upgrade "<id>"` line applies one (see items/upgrades.kdl):
+//     /relic upgrade   uses one from your offhand on the main-hand item
+//
+// name    Shown in the item's lore next to its progress, like "Polish 7/10". It
+//         and the filled pips use the rarity color of the item that applies it.
+//         When `max` pips don't fit beside the name, it shows only the numbers,
+//         so shorter names can have a higher `max` before losing them.
+// max     How many one item can take.
+// bonus   What each one adds. The first `bonus` that fits an item is the one it
+//         gets, so put specific ones above general ones.
+//   slots   Only items in these slots (mainhand, offhand, head, chest, legs, feet).
+//   kinds   Only items of these `kind`s, ignoring case.
+//   stats   What it adds, like in an item. `damage` and `attack-speed` only reach
+//           main-hand items that already have that stat.
+//
+// `element="inherit"` follows the item's own elements for that stat, in the same
+// proportions: on `damage 5` + `damage 2 element="fire"`, `damage 7
+// element="inherit"` adds 5 neutral and 2 fire. On an item without that stat it
+// is untagged. Gems and reforges don't count, so they can't change it later.
+//
+// Stacks hold only the count, so editing an upgrade changes every item that has
+// it. Lowering `max` caps items that are over it; raising it again gives it back.
+
+upgrade "polish" {
+    name "Polish"
+    max 10
+
+    bonus {
+        kinds "Sword"
+        stats {
+            damage 0.5 element="inherit"
+        }
+    }
+    bonus {
+        slots "head" "chest" "legs" "feet"
+        stats {
+            health 0.5
+            defense 1 element="inherit"
+        }
+    }
+}

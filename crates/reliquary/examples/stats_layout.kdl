@@ -12,13 +12,29 @@
 // skills  The item's skills, in the order the item lists them.
 // empty   A blank line. Dropped when what it separates is missing from an
 //         item, so an item without lore does not get two in a row.
+// divider A line across the tooltip that fades out at both ends, stretched to
+//         the width of the widest line. Text is optional and goes in the middle.
+//           exists=sockets  Only if the item has any. Also takes rarity, lore,
+//                           stats or skills.
+//           color="#7a6a9e" The line's color in the middle.
+//           fade="#241a33"  Its color at the ends.
 
-rarity
-empty
-lore
 empty
 stats
+
 empty
+divider "&fGems" exists=sockets
 sockets
+divider "&8◆" exists=sockets
+
 empty
+divider "&fAbilities" exists=skills
 skills
+
+divider "&8◆"
+
+empty
+lore
+
+empty
+rarity

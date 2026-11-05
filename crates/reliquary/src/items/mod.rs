@@ -10,12 +10,15 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 pub mod expr;
+mod font_widths;
 pub mod forge;
 mod kdl;
+mod tooltip;
 
 pub use expr::{Expr, Params, PlayerStats, Scope};
 pub use forge::{Instance, ReforgeDef, Reforges, SocketView};
 pub use kdl::{parse_file, parse_kinds, parse_rarities, parse_reforges, parse_stat_formats, parse_stats_layout};
+pub use tooltip::{Divider, Rgb};
 
 // ---- Items ----------------------------------------------------------------------
 
@@ -149,6 +152,9 @@ pub enum LoreEntry {
     Skills,
     /// The item's sockets and what is in them.
     Sockets,
+    /// A line across the tooltip, if `exists` has something to show (or always
+    /// without one).
+    Divider { divider: Divider, exists: Option<Box<LoreEntry>> },
 }
 
 impl LoreEntry {
@@ -169,7 +175,7 @@ pub struct StatFormat {
 }
 
 /// Placeholders a stat format may use.
-pub const STAT_PLACEHOLDERS: &[&str] = &["name", "sign", "value"];
+pub const STAT_PLACEHOLDERS: &[&str] = &["name", "sign", "value", "fill"];
 
 impl Default for StatFormats {
     fn default() -> Self {
@@ -203,7 +209,8 @@ impl StatFormats {
                 .unwrap_or(&self.format)
                 .replace("{name}", &name)
                 .replace("{sign}", if value >= 0.0 { "+" } else { "" })
-                .replace("{value}", &expr::format_number(value)),
+                .replace("{value}", &expr::format_number(value))
+                .replace("{fill}", &tooltip::FILL.to_string()),
         )
     }
 }
@@ -671,6 +678,33 @@ pub fn wrap(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
+/// A line of lore, before its width is known.
+enum Line<'a> {
+    Text(String),
+    Divider(&'a Divider),
+}
+
+impl Line<'_> {
+    fn is_empty(&self) -> bool {
+        matches!(self, Line::Text(text) if text.is_empty())
+    }
+
+    fn min_width(&self) -> u32 {
+        match self {
+            Line::Text(text) => tooltip::min_line_width(text),
+            Line::Divider(divider) => divider.min_width(),
+        }
+    }
+
+    fn render(self, width: u32) -> String {
+        match self {
+            Line::Text(text) if text.contains(tooltip::FILL) => tooltip::fill_line(&text, width),
+            Line::Text(text) => text,
+            Line::Divider(divider) => divider.render(width),
+        }
+    }
+}
+
 /// Cooldown group for one skill of one item. Shared by every copy of the item,
 /// and for a gem's skills by every copy of the gem.
 pub fn cooldown_group(item: &ItemDef, skill_index: usize) -> String {
@@ -689,31 +723,45 @@ impl ItemDef {
     /// Lore lines with legacy color codes. `<expr>` placeholders are filled
     /// in with `stats` (the stats of whoever holds the item).
     pub fn lore_lines(&self, stats: &PlayerStats, formats: &StatFormats) -> Vec<String> {
-        let mut lines: Vec<String> = Vec::new();
+        let mut lines: Vec<Line> = Vec::new();
         // An entry since the last line had nothing to show for this item.
         let mut missing = false;
         for entry in &formats.layout {
             if *entry == LoreEntry::Empty {
                 // Do not leave a blank line around something that is not there.
-                if !(missing && lines.last().is_none_or(String::is_empty)) {
-                    lines.push(String::new());
+                if !(missing && lines.last().is_none_or(Line::is_empty)) {
+                    lines.push(Line::Text(String::new()));
                 }
                 missing = false;
                 continue;
             }
+            if let LoreEntry::Divider { divider, exists } = entry {
+                missing = exists.as_ref().is_some_and(|e| self.lore_entry(e, stats, formats).is_empty());
+                if !missing {
+                    lines.push(Line::Divider(divider));
+                }
+                continue;
+            }
             let block = self.lore_entry(entry, stats, formats);
             missing = block.is_empty();
-            lines.extend(block);
+            lines.extend(block.into_iter().map(Line::Text));
         }
-        if missing && lines.last().is_some_and(String::is_empty) {
+        if missing && lines.last().is_some_and(Line::is_empty) {
             lines.pop();
         }
-        lines
+
+        // Tooltips are as wide as their widest line, the name included.
+        let width = tooltip::tooltip_width(
+            lines.iter().map(Line::min_width).chain([tooltip::text_width(&self.display_name())]),
+        );
+        lines.into_iter().map(|line| line.render(width)).collect()
     }
 
     fn lore_entry(&self, entry: &LoreEntry, stats: &PlayerStats, formats: &StatFormats) -> Vec<String> {
         match entry {
             LoreEntry::Empty => vec![String::new()],
+            // Placed by `lore_lines`, which knows how wide they have to be.
+            LoreEntry::Divider { .. } => Vec::new(),
             LoreEntry::Rarity => {
                 let c = &self.rarity.color;
                 vec![match &self.kind {

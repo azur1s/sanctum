@@ -3,64 +3,73 @@
 //
 // format  The line. {name} is the stat's name, {value} its amount and
 //         {sign} a "+" for amounts of 0 or more (negative ones already
-//         have their "-"). The top-level one is the default for every stat.
+//         have their "-"). {fill} is a row of dim dots that pushes what comes
+//         after it to the tooltip's right edge; give what follows its own
+//         color, or it stays dim. The top-level one is the default for every
+//         stat.
 // name    The stat's name in the lore. Defaults to the stat in title case,
 //         like "Magic Power".
 // hidden  #true leaves the stat out of the lore. It still counts.
+//
+// Icons are ordinary text. These are drawn by Minecraft's normal font, so the
+// dots line up exactly: ❤ ♥ ⚔ ☠ ☄ ⚡ 🛡 ★ ☆ ◆ ◇ ♦ ♠ ♣ ● ○ ■ □ ▲ ▼ ▶ ◀ ☽ ☀ ☁ ☂
+// ☃ ♪ ♫ ✎ ⚑ ∞ ✔. Others may be a pixel or two off (like ✦ ✖ ☘ ❈ ➜).
 
-format "&7{name} &b{sign}{value}"
+format "&7• {name}{fill}&b{sign}{value}"
 
 // Damage and attack speed are the item's totals, not bonuses: no sign.
 stat "damage" {
     name "Damage"
-    format "&7{name} &c{value}"
+    format "&c⚔ &7{name}{fill}&c{value}"
 }
 
 stat "attack-speed" {
     name "Attack Speed"
-    format "&7{name} &e{value}"
+    format "&e⚡ &7{name}{fill}&e{value}"
 }
 
 stat "health" {
     name "Health"
-    format "&7{name} &c{sign}{value}"
+    format "&c❤ &7{name}{fill}&c{sign}{value}"
 }
 
 stat "armor" {
     name "Armor"
-    format "&7{name} &a{sign}{value}"
+    format "&a🛡 &7{name}{fill}&a{sign}{value}"
 }
 
 stat "armor-toughness" {
     name "Armor Toughness"
-    format "&7{name} &a{sign}{value}"
+    format "&a♦ &7{name}{fill}&a{sign}{value}"
 }
 
 // Percent: `speed 10` is 10% faster.
 stat "speed" {
     name "Speed"
-    format "&7{name} &f{sign}{value}%"
+    format "&f▶ &7{name}{fill}&f{sign}{value}%"
 }
 
 stat "strength" {
     name "Strength"
-    format "&7{name} &c{sign}{value}"
+    format "&c☠ &7{name}{fill}&c{sign}{value}"
 }
 
 stat "magic-power" {
     name "Magic Power"
-    format "&7{name} &d{sign}{value}"
+    format "&d★ &7{name}{fill}&d{sign}{value}"
 }
 
 stat "magic-armor" {
     name "Magic Armor"
-    format "&7{name} &d{sign}{value}"
+    format "&d☆ &7{name}{fill}&d{sign}{value}"
 }
 
 stat "max-mana" {
     name "Max Mana"
+    format "&b☽ &7{name}{fill}&b{sign}{value}"
 }
 
 stat "mana-regen" {
     name "Mana Regen"
+    format "&b☄ &7{name}{fill}&b{sign}{value}"
 }

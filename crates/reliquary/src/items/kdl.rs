@@ -257,6 +257,16 @@ pub fn parse_stats_layout(file: &str, src: &str) -> R<(Vec<LoreEntry>, Vec<(Stri
             "stats" => LoreEntry::Stats,
             "skills" => LoreEntry::Skills,
             "sockets" => LoreEntry::Sockets,
+            "divider" => {
+                p.shape(node, 1, &["exists", "color", "fade"], false)?;
+                let divider = Divider {
+                    title: args(node).next().map(|e| p.string(e)).transpose()?.unwrap_or_default(),
+                    color: prop(node, "color").map(|e| p.rgb(e)).transpose()?.unwrap_or(Divider::DEFAULT_COLOR),
+                    fade: prop(node, "fade").map(|e| p.rgb(e)).transpose()?.unwrap_or(Divider::DEFAULT_FADE),
+                };
+                let exists = prop(node, "exists").map(|e| p.lore_section(e)).transpose()?.map(Box::new);
+                LoreEntry::Divider { divider, exists }
+            }
             "stat" => {
                 p.shape(node, 1, &[], false)?;
                 let entry = p.arg(node, 0, "a stat, like `stat \"magic-power\"`")?;
@@ -266,13 +276,13 @@ pub fn parse_stats_layout(file: &str, src: &str) -> R<(Vec<LoreEntry>, Vec<(Stri
                 LoreEntry::Stat(stat)
             }
             other => {
-                return Err(p.at(node, format!("unknown lore entry `{other}` (expected rarity, lore, stat, stats, skills or empty)")));
+                return Err(p.at(node, format!("unknown lore entry `{other}` (expected rarity, lore, stat, stats, sockets, skills, divider or empty)")));
             }
         };
-        if !matches!(entry, LoreEntry::Stat(_)) {
+        if !matches!(entry, LoreEntry::Stat(_) | LoreEntry::Divider { .. }) {
             p.shape(node, 0, &[], false)?;
         }
-        if entry != LoreEntry::Empty && layout.contains(&entry) {
+        if !matches!(entry, LoreEntry::Empty | LoreEntry::Divider { .. }) && layout.contains(&entry) {
             return Err(p.at(node, format!("lore entry `{}` is listed twice", name(node))));
         }
         layout.push(entry);
@@ -530,6 +540,29 @@ impl Parser<'_> {
         self.string(self.arg(node, 0, what)?)
     }
 
+    /// A color like "#7a6a9e".
+    fn rgb(&self, entry: &KdlEntry) -> R<Rgb> {
+        let text = self.string(entry)?;
+        let parsed = text.strip_prefix('#').filter(|hex| hex.len() == 6 && hex.is_ascii()).and_then(|hex| {
+            let part = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).ok();
+            Some((part(0)?, part(2)?, part(4)?))
+        });
+        parsed.ok_or_else(|| self.at_entry(entry, format!("`{text}` is not a color like \"#7a6a9e\"")))
+    }
+
+    /// The lore section a divider goes with, for `exists`.
+    fn lore_section(&self, entry: &KdlEntry) -> R<LoreEntry> {
+        let text = self.string(entry)?;
+        match text.as_str() {
+            "rarity" => Ok(LoreEntry::Rarity),
+            "lore" => Ok(LoreEntry::Lore),
+            "stats" => Ok(LoreEntry::Stats),
+            "sockets" => Ok(LoreEntry::Sockets),
+            "skills" => Ok(LoreEntry::Skills),
+            _ => Err(self.at_entry(entry, format!("unknown section `{text}` (expected rarity, lore, stats, sockets or skills)"))),
+        }
+    }
+
     /// A stat line like "&7{name} &b{sign}{value}"; unknown `{...}` are errors.
     fn stat_format(&self, node: &KdlNode) -> R<String> {
         let format = self.str_arg(node, "a line, like \"&7{name} &b{sign}{value}\"")?;
@@ -543,9 +576,12 @@ impl Parser<'_> {
             };
             let key = &rest[open + 1..open + close];
             if !STAT_PLACEHOLDERS.contains(&key) {
-                return Err(self.err(at, format!("unknown placeholder `{{{key}}}` (expected {{name}}, {{sign}} or {{value}})")));
+                return Err(self.err(at, format!("unknown placeholder `{{{key}}}` (expected {{name}}, {{sign}}, {{value}} or {{fill}})")));
             }
             rest = &rest[open + close + 1..];
+        }
+        if format.matches("{fill}").count() > 1 {
+            return Err(self.at_entry(entry, "`{fill}` can only be used once in a line"));
         }
         Ok(format)
     }
@@ -1295,7 +1331,8 @@ mod tests {
         assert_eq!(lore[0], "&5Epic Sword");
         // Vanilla-backed stats show too, in the file's order.
         let at = |line: &str| lore.iter().position(|l| l == line).unwrap_or_else(|| panic!("{line} in {lore:?}"));
-        assert!(at("&7Damage &c12") < at("&7Attack Speed &e1.6"));
+        let at_stat = |name: &str| lore.iter().position(|l| l.contains(name)).unwrap_or_else(|| panic!("{name} in {lore:?}"));
+        assert!(at_stat("Damage") < at_stat("Attack Speed"));
         assert_eq!(item(include_str!("../../examples/items/moonlit_edge.kdl")).display_name(), "&5Moonlit Edge");
         assert!(lore.iter().any(|l| l == "&5◆ &fMoon Slash &8· &7Right-click"), "{lore:?}");
         assert!(lore.iter().any(|l| l == "&8  20 mana · 3s cooldown"), "{lore:?}");
@@ -1305,7 +1342,7 @@ mod tests {
         let stats = PlayerStats::from([("magic_power".to_string(), 50.0)]);
         let lore = storm.lore_lines(&stats, &formats).join("\n");
         assert!(lore.contains("&526.5"), "{lore}");
-        assert!(lore.contains("&7Mana Regen &b+2"), "{lore}");
+        assert!(lore.contains("Mana Regen"), "{lore}");
     }
 
     #[test]
@@ -1319,8 +1356,6 @@ mod tests {
         let default = a.lore_lines(&PlayerStats::new(), &StatFormats::default());
         let (rarity, text, armor, health) = (default[0].as_str(), "&7&oOld.", "&7Armor &b+2", "&7Health &b+4");
 
-        // The example file is the default.
-        assert_eq!(lore(include_str!("../../examples/stats_layout.kdl")), default);
         assert_eq!(default, [rarity, "", text, "", armor, health]);
         // Blank lines are only where they are listed, even at the top or doubled.
         assert_eq!(lore("stats\nrarity\nlore"), [armor, health, rarity, text]);
@@ -1348,6 +1383,42 @@ mod tests {
         assert!(parse_stats_layout("f.kdl", "stat").is_err());
         let refs = parse_stats_layout("f.kdl", "lore\nstat \"magic-power\"").unwrap().1;
         assert_eq!(refs, [("magic_power".to_string(), "f.kdl:2:1".to_string())]);
+    }
+
+    #[test]
+    fn dividers_and_fill_line_up() {
+        let src = "item \"a\" {\n  name \"A rather long item name here\"\n  base \"minecraft:stick\"\n  stats {\n    armor 2\n    health 40\n    speed 12.5\n  }\n}";
+        let a = item(src);
+        let mut formats = parse_stat_formats("f.kdl", "format \"&7{name}{fill}&b{sign}{value}\"\nstat \"health\" {\n  format \"&c❤ &7{name}{fill}&c{sign}{value}\"\n}").unwrap().0;
+        formats.layout = parse_stats_layout("f.kdl", "divider \"&fStats\" exists=stats\nstats\ndivider exists=stats\nempty\ndivider \"Gems\" exists=sockets\nsockets\nempty\nrarity").unwrap().0;
+        let lore = a.lore_lines(&PlayerStats::new(), &formats);
+        // No sockets: no divider, and no blank line for it.
+        assert_eq!(lore.iter().filter(|l| l.is_empty()).count(), 1, "{lore:?}");
+        assert!(!lore.iter().any(|l| l.contains("Gems")), "{lore:?}");
+        // Everything that stretches ends up the same width.
+        let width = |l: &String| super::tooltip::text_width(l);
+        let wanted = width(&lore[0]);
+        assert_eq!(lore[..5].iter().map(width).collect::<Vec<_>>(), [wanted; 5], "{lore:?}");
+        assert!(wanted >= 150);
+        assert!(lore.iter().all(|l| !l.contains(super::tooltip::FILL)), "{lore:?}");
+
+        // A long stat line stretches the rest.
+        let long = item("item \"a\" {\n  name \"A\"\n  base \"minecraft:stick\"\n  stats {\n    armor 123456789012345678901234567890\n    health 4\n  }\n}");
+        let lore = long.lore_lines(&PlayerStats::new(), &formats);
+        assert!(width(&lore[0]) > 150);
+        assert_eq!(width(&lore[1]), width(&lore[0]), "{lore:?}");
+
+        let e = parse_stats_layout("f.kdl", "divider exists=socket").unwrap_err().to_string();
+        assert!(e.contains("unknown section `socket`"), "{e}");
+        let e = parse_stats_layout("f.kdl", "divider color=\"red\"").unwrap_err().to_string();
+        assert!(e.contains("not a color"), "{e}");
+        let e = parse_stats_layout("f.kdl", "divider width=3").unwrap_err().to_string();
+        assert!(e.contains("unknown option `width`"), "{e}");
+        let e = parse_stat_formats("f.kdl", "format \"{name}{fill}{value}{fill}\"").unwrap_err().to_string();
+        assert!(e.contains("only be used once"), "{e}");
+        let parsed = parse_stats_layout("f.kdl", "divider \"x\" color=\"#010203\" fade=\"#a0b0c0\"\ndivider").unwrap().0;
+        assert_eq!(parsed.len(), 2);
+        assert!(matches!(&parsed[0], LoreEntry::Divider { divider, exists: None } if divider.color == (1, 2, 3) && divider.fade == (0xa0, 0xb0, 0xc0)));
     }
 
     #[test]

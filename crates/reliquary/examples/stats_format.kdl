@@ -59,6 +59,18 @@ stat "strength" {
     format "{color:&c}☠ &7{name}{fill}&c{sign}{value}"
 }
 
+// Percents: `crit-chance 25` crits one hit in four, and a crit deals
+// 1 + crit-power / 100 times the damage. Players start with 50 crit power (1.5x).
+stat "crit-chance" {
+    name "Crit Chance"
+    format "&6◇ &7{name}{fill}&6{sign}{value}%"
+}
+
+stat "crit-power" {
+    name "Crit Power"
+    format "&6◆ &7{name}{fill}&6{sign}{value}%"
+}
+
 stat "magic-power" {
     name "Magic Power"
     format "{color:&d}★ &7{name}{fill}&d{sign}{value}"

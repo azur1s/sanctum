@@ -735,6 +735,7 @@ impl Parser<'_> {
         let mut uses = Vec::new();
         let (mut sockets, mut gem, mut reforgeable) = (Vec::new(), None, true);
         let mut upgrade = None;
+        let (mut unbreakable, mut hide_unbreakable, mut fake_enchant) = (false, false, false);
 
         for child in children(node) {
             match name(child) {
@@ -744,6 +745,18 @@ impl Parser<'_> {
                 "reforgeable" => {
                     self.shape(child, 1, &[], false)?;
                     reforgeable = self.boolean(self.arg(child, 0, "#true or #false")?)?;
+                }
+                "unbreakable" => {
+                    self.shape(child, 1, &["hidden"], false)?;
+                    unbreakable = self.boolean(self.arg(child, 0, "#true or #false")?)?;
+                    hide_unbreakable = self.opt(child, "hidden", |e| self.boolean(e))?.unwrap_or(false);
+                    if hide_unbreakable && !unbreakable {
+                        return Err(self.at(child, "`hidden=#true` only does something with `unbreakable #true`"));
+                    }
+                }
+                "fake-enchant" => {
+                    self.shape(child, 1, &[], false)?;
+                    fake_enchant = self.boolean(self.arg(child, 0, "#true or #false")?)?;
                 }
                 "name" => item_name = Some(self.str_arg(child, "the item name")?),
                 "base" => base = Some(self.str_arg(child, "a vanilla item, like \"minecraft:diamond_sword\"")?),
@@ -809,6 +822,9 @@ impl Parser<'_> {
             sockets,
             gem,
             reforgeable,
+            unbreakable,
+            hide_unbreakable,
+            fake_enchant,
             upgrade,
             socket_views: Vec::new(),
             upgrade_views: Vec::new(),
@@ -1563,6 +1579,23 @@ mod tests {
         let problems = link(parsed.items.remove(0), &library(), &rarities()).unwrap_err();
         assert!(problems[0].starts_with("i.kdl:4:3: skill `thunderstrike` has no param `dmage`"), "{problems:?}");
         assert!(problems[1].starts_with("i.kdl:5:3: unknown skill `nope`"), "{problems:?}");
+    }
+
+    #[test]
+    fn unbreakable_and_fake_enchant() {
+        let read = |fields: &str| parse_file("i.kdl", &format!("item \"a\" {{\n  name \"A\"\n  base \"x\"\n  {fields}\n}}"));
+        let plain = read("").unwrap().items.remove(0).item;
+        assert!(!plain.unbreakable && !plain.fake_enchant);
+        let both = read("unbreakable #true\n  fake-enchant #true").unwrap().items.remove(0).item;
+        assert!(both.unbreakable && both.fake_enchant);
+        let off = read("unbreakable #false\n  fake-enchant #false").unwrap().items.remove(0).item;
+        assert!(!off.unbreakable && !off.fake_enchant);
+        assert!(read("fake-enchant \"sharpness\"").unwrap_err().message.contains("#true or #false"));
+        assert!(!both.hide_unbreakable);
+        let hidden = read("unbreakable #true hidden=#true").unwrap().items.remove(0).item;
+        assert!(hidden.unbreakable && hidden.hide_unbreakable);
+        assert!(read("unbreakable #false hidden=#true").unwrap_err().message.contains("only does something"));
+        assert!(read("unbreakable #true hidden=\"yes\"").unwrap_err().message.contains("#true or #false"));
     }
 
     #[test]

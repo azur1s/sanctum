@@ -9,6 +9,10 @@ item "moonlit_edge" {
     // One socket for red gems, one for any gem. See gems.kdl.
     sockets "red" "any"
     lore "Forged under a silver moon."
+    // Optional, both off by default:
+    //   unbreakable #true   never loses durability; add hidden=#true to leave
+    //                       out the client's "Unbreakable" tooltip line
+    //   fake-enchant #true  enchantment glint only, no enchantment behind it
 
     stats {
         damage       12

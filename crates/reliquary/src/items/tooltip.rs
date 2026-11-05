@@ -36,8 +36,8 @@ pub struct Divider {
 }
 
 impl Divider {
-    pub const DEFAULT_COLOR: Rgb = (0x7A, 0x6A, 0x9E);
-    pub const DEFAULT_FADE: Rgb = (0x24, 0x1A, 0x33);
+    pub const DEFAULT_COLOR: Rgb = (0x7A, 0x6A, 0x9E); // #7A6A9E
+    pub const DEFAULT_FADE: Rgb = (0x24, 0x1A, 0x33); // #241A33
 
     /// The fewest pixels this divider can take.
     pub(super) fn min_width(&self) -> u32 {
@@ -70,6 +70,7 @@ impl Divider {
 pub(super) fn text_width(line: &str) -> u32 {
     let mut width = 0;
     let mut bold = false;
+    let line = expand_hex(line);
     let mut chars = line.chars().peekable();
     while let Some(c) = chars.next() {
         if c == FILL {
@@ -187,6 +188,33 @@ fn lerp(from: Rgb, to: Rgb, t: f32) -> Rgb {
     (mix(from.0, to.0), mix(from.1, to.1), mix(from.2, to.2))
 }
 
+/// `&#ff8800` -> `&x&f&f&8&8&0&0`, which is what the legacy parser reads.
+/// Anything that isn't six hex digits is left alone.
+pub fn expand_hex(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(at) = rest.find("&#") {
+        out.push_str(&rest[..at]);
+        let after = &rest[at + 2..];
+        match after.get(..6).filter(|hex| hex.bytes().all(|b| b.is_ascii_hexdigit())) {
+            Some(hex) => {
+                out.push_str("&x");
+                for c in hex.chars() {
+                    out.push('&');
+                    out.push(c.to_ascii_lowercase());
+                }
+                rest = &after[6..];
+            }
+            None => {
+                out.push_str("&#");
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 /// `&x&R&R&G&G&B&B`, the legacy way to spell a hex color.
 fn hex_code((r, g, b): Rgb) -> String {
     let mut out = String::from("&x");
@@ -200,6 +228,17 @@ fn hex_code((r, g, b): Rgb) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expands_hex_shorthand() {
+        assert_eq!(expand_hex("&#FF8800Hi &#123456"), "&x&f&f&8&8&0&0Hi &x&1&2&3&4&5&6");
+        // Too short, not hex, or cut off inside a character: not a color.
+        for s in ["&#ff88", "&#ggggggHi", "&#ff88é", "plain &a text"] {
+            assert_eq!(expand_hex(s), s);
+        }
+        assert_eq!(text_width("&#123456Hi"), 8);
+        assert_eq!(text_width("&l&#123456Hi"), 10);
+    }
 
     #[test]
     fn widths_match_the_client() {

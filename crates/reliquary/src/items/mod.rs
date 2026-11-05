@@ -18,7 +18,7 @@ mod tooltip;
 pub use expr::{Expr, Params, PlayerStats, Scope};
 pub use forge::{link_upgrades, Instance, ReforgeDef, Reforges, SocketView, UpgradeDef, UpgradeView, Upgrades};
 pub use kdl::{parse_elements, parse_file, parse_kinds, parse_rarities, parse_reforges, parse_stat_formats, parse_stats_layout, parse_upgrades};
-pub use tooltip::{Divider, Rgb};
+pub use tooltip::{expand_hex, Divider, Rgb};
 
 // ---- Items ----------------------------------------------------------------------
 
@@ -46,6 +46,13 @@ pub struct ItemDef {
     pub gem: Option<String>,
     /// `reforgeable #false` keeps reforges off this item.
     pub reforgeable: bool,
+    /// `unbreakable #true` stops the item losing durability.
+    pub unbreakable: bool,
+    /// `unbreakable #true hidden=#true` leaves out the client's "Unbreakable" line.
+    pub hide_unbreakable: bool,
+    /// `fake-enchant #true` gives the item the enchantment glint, with no
+    /// enchantment behind it.
+    pub fake_enchant: bool,
     /// Set on upgrade items: the upgrade in `upgrades.kdl` it applies.
     pub upgrade: Option<String>,
     /// Filled in by `with_instance`, for the lore.
@@ -115,6 +122,8 @@ pub const BUILTIN_STATS: &[StatInfo] = &[
     StatInfo { name: "speed", main_hand_only: false },
     StatInfo { name: "max_mana", main_hand_only: false },
     StatInfo { name: "mana_regen", main_hand_only: false },
+    StatInfo { name: "crit_chance", main_hand_only: false },
+    StatInfo { name: "crit_power", main_hand_only: false },
 ];
 
 pub fn stat_info(name: &str) -> Option<&'static StatInfo> {
@@ -834,11 +843,11 @@ pub fn wrap(text: &str, width: usize) -> Vec<String> {
     let mut color = String::new();
     let mut formats = String::new();
 
-    for word in text.split(' ') {
+    for word in expand_hex(text).split(' ') {
         let mut word_visible = 0;
         let mut chars = word.chars().peekable();
         while let Some(c) = chars.next() {
-            if c == '&' && chars.peek().is_some_and(|&n| is_color(n) || is_format(n) || n == 'r') {
+            if c == '&' && chars.peek().is_some_and(|&n| is_color(n) || is_format(n) || n == 'r' || n == 'x') {
                 chars.next();
             } else {
                 word_visible += 1;
@@ -862,6 +871,14 @@ pub fn wrap(text: &str, width: usize) -> Vec<String> {
                 continue;
             }
             match chars.peek().copied() {
+                // A hex color is one color, not seven codes. Unlike `&a`, the
+                // parser leaves bold and the like on after it.
+                Some('x') => {
+                    chars.next();
+                    let digits: String = chars.by_ref().take(12).collect();
+                    color = format!("&x{digits}");
+                    continue;
+                }
                 Some(n) if is_color(n) => {
                     color = format!("&{n}");
                     formats.clear();
@@ -1040,6 +1057,24 @@ mod tests {
         // A color code resets formats, &r resets everything.
         let lines = wrap("&l&cbold red then &rplain text here", 10);
         assert_eq!(lines, ["&l&cbold red", "&cthen &rplain", "text here"]);
+    }
+
+    #[test]
+    fn wrap_carries_hex_colors() {
+        // Both spellings come out the long way, and neither counts as width.
+        let long = "&x&f&f&8&8&0&0";
+        assert_eq!(wrap("&#ff8800one two three", 3), [format!("{long}one"), format!("{long}two"), format!("{long}three")]);
+        assert_eq!(wrap(&format!("{long}one two"), 3), [format!("{long}one"), format!("{long}two")]);
+        // Hex leaves formats on; a plain color after it takes over.
+        assert_eq!(wrap("&l&#ff8800one two", 3), [format!("&l{long}one"), format!("{long}&ltwo")]);
+        assert_eq!(wrap("&#ff8800one &ctwo three", 7), [format!("{long}one &ctwo"), "&cthree".to_string()]);
+    }
+
+    #[test]
+    fn hex_names_look_right() {
+        let mut parsed = parse_file("i.kdl", "item \"a\" {\n  name \"&#ff8800A\"\n  base \"x\"\n}").unwrap();
+        assert_eq!(parsed.items.remove(0).item.name, "&#ff8800A");
+        assert_eq!(tooltip::text_width("&#ff8800A"), tooltip::text_width("A"));
     }
 
     #[test]

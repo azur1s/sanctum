@@ -3,7 +3,8 @@
 //
 // name  Shown in the lore, before the item's kind: "Epic Sword".
 // color Color codes put before the item name, the lore's rarity line and
-//       skill bullets, like "&5" (or several, like "&6&l").
+//       skill bullets, like "&5" (or several, like "&6&l"). Hex colors work
+//       too, here and in any other text, like "&#ff8800".
 
 rarity "common" {
     name "Common"

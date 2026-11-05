@@ -41,6 +41,8 @@ static PENDING: Mutex<Vec<Pending>> = Mutex::new(Vec::new());
 static BY_PLAYER: Mutex<Option<HashMap<u32, Option<String>>>> = Mutex::new(None);
 /// Entities hit this tick -> the elements of those hits, for their icons.
 static HIT_ELEMENTS: Mutex<Option<HashMap<u32, Vec<String>>>> = Mutex::new(None);
+/// Entities that took a crit this tick, for their numbers' look.
+static CRITS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
 static FLUSH_SCHEDULED: AtomicBool = AtomicBool::new(false);
 
 /// Marks that a player damaged `entity` (with a skill's damage `kind`, if
@@ -62,6 +64,11 @@ pub fn note_elements(entity: u32, elements: Vec<String>) {
             entry.push(element);
         }
     }
+}
+
+/// Marks a hit on `entity` as a crit, so its number stands out.
+pub fn note_crit(entity: u32) {
+    CRITS.lock().unwrap().push(entity);
 }
 
 /// The damage type of the hit `entity` is taking right now, as a name like
@@ -150,6 +157,7 @@ fn flush(server: &Server) {
     let pending = std::mem::take(&mut *PENDING.lock().unwrap());
     let by_player = BY_PLAYER.lock().unwrap().take().unwrap_or_default();
     let hit_elements = HIT_ELEMENTS.lock().unwrap().take().unwrap_or_default();
+    let crits = std::mem::take(&mut *CRITS.lock().unwrap());
     let elements = crate::game::elements();
     for hit in pending {
         let by = by_player.get(&hit.id);
@@ -158,7 +166,8 @@ fn flush(server: &Server) {
         }
         let (prefix, color) = style(by.and_then(|k| k.as_deref()), hit.kind);
         let icons = hit_elements.get(&hit.id).map_or_else(String::new, |ids| elements.icons(ids));
-        let style = (format!("{icons}{color}{prefix}"), color);
+        let number_color = if crits.contains(&hit.id) { "&6&l".to_string() } else { color.clone() };
+        let style = (format!("{icons}{color}{prefix}"), number_color);
         let Some((entity, _)) = find(server, hit.id) else { continue };
         let lost = match entity.as_living() {
             Some(l) if !l.is_dead() => hit.health_before - l.get_health(),

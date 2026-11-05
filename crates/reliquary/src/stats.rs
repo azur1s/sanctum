@@ -10,8 +10,11 @@ use crate::game;
 use crate::items::{ItemDef, PlayerStats, Slot};
 use crate::mana;
 
+/// Extra damage of a crit before items, in percent: 50 is 1.5x.
+const BASE_CRIT_POWER: f64 = 50.0;
+
 /// Every player has these before items.
-pub const BASE: &[(&str, f64)] = &[("max_mana", 100.0), ("mana_regen", 5.0)];
+pub const BASE: &[(&str, f64)] = &[("max_mana", 100.0), ("mana_regen", 5.0), ("crit_power", BASE_CRIT_POWER)];
 
 /// Stats from the last regen tick, to notice changes.
 static LAST: Mutex<Option<HashMap<String, PlayerStats>>> = Mutex::new(None);
@@ -55,9 +58,10 @@ pub fn current(player: &Player) -> PlayerStats {
 }
 
 /// What a mob's gear adds up to: each relic must be in the slot it is made for,
-/// like on a player. Mobs have no base stats.
+/// like on a player. Crit power is a mob's only base stat, so that crit chance
+/// on its gear does something.
 fn of_mob(entity: &Entity) -> PlayerStats {
-    let mut total = PlayerStats::new();
+    let mut total = PlayerStats::from([("crit_power".to_string(), BASE_CRIT_POWER)]);
     let Some(living) = entity.as_living() else { return total };
     let slots = [
         (Slot::MainHand, EquipmentSlot::MainHand),
@@ -84,6 +88,13 @@ pub fn of_entity(server: &Server, entity: &Entity) -> PlayerStats {
         Some(player) => current(&player),
         None => of_mob(entity),
     }
+}
+
+/// What a hit is multiplied by if `roll` (0.0..1.0) makes it a crit. `crit_chance`
+/// and `crit_power` are percents. A crit never does less than a normal hit.
+pub fn crit_multiplier(stats: &PlayerStats, roll: f64) -> Option<f64> {
+    let chance = stats.get("crit_chance").copied().unwrap_or(0.0) / 100.0;
+    (roll < chance).then(|| 1.0 + stats.get("crit_power").copied().unwrap_or(0.0).max(0.0) / 100.0)
 }
 
 /// Stats plus live values for skills: `self.mana`, `self.hp`, `self.max_hp`.
@@ -116,4 +127,35 @@ pub fn known_names(declared: &BTreeSet<String>) -> BTreeSet<String> {
     names.extend(["mana", "hp", "max_hp"].map(String::from));
     names.extend(declared.iter().cloned());
     names
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stats(chance: f64, power: f64) -> PlayerStats {
+        PlayerStats::from([("crit_chance".to_string(), chance), ("crit_power".to_string(), power)])
+    }
+
+    #[test]
+    fn crit_chance_is_a_percent() {
+        assert_eq!(crit_multiplier(&stats(25.0, 50.0), 0.24), Some(1.5));
+        assert_eq!(crit_multiplier(&stats(25.0, 50.0), 0.25), None);
+        assert_eq!(crit_multiplier(&stats(0.0, 50.0), 0.0), None);
+        assert_eq!(crit_multiplier(&stats(100.0, 50.0), 0.999), Some(1.5));
+        assert_eq!(crit_multiplier(&PlayerStats::new(), 0.0), None);
+    }
+
+    #[test]
+    fn crit_power_adds_up_and_never_weakens_a_hit() {
+        assert_eq!(crit_multiplier(&stats(100.0, 150.0), 0.5), Some(2.5));
+        assert_eq!(crit_multiplier(&stats(100.0, -80.0), 0.5), Some(1.0));
+    }
+
+    #[test]
+    fn crit_stats_are_builtin_on_any_slot() {
+        for stat in ["crit_chance", "crit_power"] {
+            assert!(!crate::items::stat_info(stat).unwrap().main_hand_only);
+        }
+    }
 }

@@ -437,25 +437,6 @@ fn write_string(out: &mut Vec<u8>, s: &str) {
     out.extend_from_slice(s.as_bytes());
 }
 
-/// Network NBT string tag: type id 8, u16 length, then (modified) UTF-8.
-/// Matches plain UTF-8 for anything but NUL and characters outside the BMP.
-fn write_nbt_string(out: &mut Vec<u8>, s: &str) {
-    out.push(8);
-    out.extend_from_slice(&(s.len() as u16).to_be_bytes());
-    out.extend_from_slice(s.as_bytes());
-}
-
-/// `&5Name` -> `§5Name`, for text the client formats itself.
-fn section_codes(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        let is_code = chars.peek().is_some_and(|n| n.is_ascii_hexdigit() || matches!(n.to_ascii_lowercase(), 'k'..='o' | 'r'));
-        out.push(if c == '&' && is_code { '§' } else { c });
-    }
-    out
-}
-
 fn attribute_slot(slot: Slot) -> AttributeModifierSlot {
     match slot {
         Slot::MainHand => AttributeModifierSlot::MainHand,
@@ -521,19 +502,23 @@ pub(crate) fn relic_of(stack: &ItemStack) -> Option<Arc<ItemDef>> {
 pub(crate) fn build_stack(base: &ItemDef, instance: &Instance, count: u8, stats: &PlayerStats) -> ItemStack {
     let def = &apply_instance(base, instance);
     let stack = ItemStack::new(&def.base, count);
-    // Workaround: Pumpkin sends `custom_name` as plain text, dropping colors
-    // and `italic(false)`. `item_name` is not italic and is sent as a
-    // translate key, which the client shows as-is with `§` codes applied.
-    // Go back to `set_custom_name` once the server has the CustomName fix.
-    let mut name = Vec::new();
-    write_nbt_string(&mut name, &section_codes(&def.display_name()));
-    stack.set_component(DataComponent::ItemName, &name);
+    // Needs a server with Pumpkin #4334: without it, this name loses its colors.
+    stack.set_custom_name(Some(text(&def.display_name()).italic(false)));
     stack.set_lore(def.lore_lines(stats, &stat_formats()).iter().map(|l| text(l).italic(false)).collect());
 
     if let Some(model) = &def.model {
         let mut bytes = Vec::new();
         write_string(&mut bytes, model);
         stack.set_component(DataComponent::ItemModel, &bytes);
+    }
+    // Raw components, like the rest of this function: the plugin API we build
+    // against has no setters for these. Unbreakable has no value; the glint
+    // override is one bool.
+    if def.unbreakable {
+        stack.set_component(DataComponent::Unbreakable, &[]);
+    }
+    if def.fake_enchant {
+        stack.set_component(DataComponent::EnchantmentGlintOverride, &[1]);
     }
     // Stats backed by vanilla attributes. The player has 1 base damage and
     // 4 base attack speed; the tooltip shows totals, so store the difference
@@ -565,21 +550,12 @@ pub(crate) fn build_stack(base: &ItemDef, instance: &Instance, count: u8, stats:
     // The lore shows the stats, so hide the client's "When in Main Hand" lines.
     // tooltip_display: hide_tooltip, then a VarInt count and component ids
     // (each below 128, so one VarInt byte). The modifiers still apply.
-    stack.set_component(DataComponent::TooltipDisplay, &[0, 1, DataComponent::AttributeModifiers as u8]);
-    // The cooldown overlay follows one group per item: use the first
-    // right-click skill that has a cooldown.
-    let overlay = def
-        .skills
-        .iter()
-        .enumerate()
-        .find(|(_, s)| engine::shows_overlay(s));
-    if let Some((index, skill)) = overlay {
-        // use_cooldown: f32 seconds (big endian), then an optional group string.
-        let mut bytes = skill.cooldown.to_be_bytes().to_vec();
-        bytes.push(1);
-        write_string(&mut bytes, &engine::cooldown_group(def, index));
-        stack.set_component(DataComponent::UseCooldown, &bytes);
+    let mut display = vec![0, 1, DataComponent::AttributeModifiers as u8];
+    if def.hide_unbreakable {
+        display[1] += 1;
+        display.push(DataComponent::Unbreakable as u8);
     }
+    stack.set_component(DataComponent::TooltipDisplay, &display);
     stack.set_string(NS, "id", &def.id);
     if let Some(reforge) = &instance.reforge {
         stack.set_string(NS, "reforge", reforge);
@@ -591,6 +567,19 @@ pub(crate) fn build_stack(base: &ItemDef, instance: &Instance, count: u8, stats:
         stack.set_string(NS, "upgrades", &upgrades);
     }
     stack
+}
+
+/// Carries durability damage over to a rebuilt stack: it only lives on the
+/// stack, so `build_stack` can't know it. Skipped if the base item changed, as
+/// a diamond sword's damage could break a golden one on its next hit.
+fn keep_damage(old: &ItemStack, new: &ItemStack) {
+    if old.get_registry_key() != new.get_registry_key() {
+        return;
+    }
+    let damage = old.get_components().into_iter().find(|c| matches!(c.component, DataComponent::Damage));
+    if let Some(damage) = damage {
+        new.set_component(DataComponent::Damage, &damage.value);
+    }
 }
 
 /// The relic in the player's main hand.
@@ -616,7 +605,9 @@ fn refresh_inventory(player: &Player) {
     let rebuild = |stack: Option<ItemStack>| {
         let stack = stack?;
         let def = item(&stack.get_string(NS, "id")?)?;
-        Some(build_stack(&def, &instance_of(&stack), stack.get_count(), &stats))
+        let rebuilt = build_stack(&def, &instance_of(&stack), stack.get_count(), &stats);
+        keep_damage(&stack, &rebuilt);
+        Some(rebuilt)
     };
     let inv = player.get_inventory();
     // The plugin API's generic `set_item` only writes slots 0-35 of a player
@@ -648,7 +639,11 @@ fn max_mana(stats: &PlayerStats) -> u32 {
 }
 
 fn show_mana(player: &Player, mana: u32, max: u32) {
-    player.show_actionbar(text(&format!("&b✦ Mana {mana}/{max}")));
+    if crate::admin::infinite_mana() {
+        player.show_actionbar(text("&b✦ Mana ∞"));
+    } else {
+        player.show_actionbar(text(&format!("&b✦ Mana {mana}/{max}")));
+    }
 }
 
 /// Runs every skill of `items` whose trigger passes `when`. `other` is the
@@ -811,6 +806,30 @@ impl CommandHandler for SetMana {
     }
 }
 
+fn on_off(enabled: bool) -> &'static str {
+    if enabled { "&aON" } else { "&cOFF" }
+}
+
+/// `/relic admin nocd`: toggles ability cooldowns off for everyone.
+struct AdminNoCooldown;
+impl CommandHandler for AdminNoCooldown {
+    fn handle(&self, sender: CommandSender, _: Server, _: ConsumedArgs) -> Result<i32, CommandError> {
+        let enabled = crate::admin::toggle_no_cooldown();
+        sender.send_message(text(&format!("&eNo cooldowns: {}", on_off(enabled))));
+        Ok(1)
+    }
+}
+
+/// `/relic admin infinite_mana`: toggles free skills for everyone.
+struct AdminInfiniteMana;
+impl CommandHandler for AdminInfiniteMana {
+    fn handle(&self, sender: CommandSender, _: Server, _: ConsumedArgs) -> Result<i32, CommandError> {
+        let enabled = crate::admin::toggle_infinite_mana();
+        sender.send_message(text(&format!("&eInfinite mana: {}", on_off(enabled))));
+        Ok(1)
+    }
+}
+
 struct Give;
 impl CommandHandler for Give {
     fn handle(&self, sender: CommandSender, _: Server, args: ConsumedArgs) -> Result<i32, CommandError> {
@@ -918,7 +937,11 @@ fn held_for_forge(player: &Player) -> Result<(Arc<ItemDef>, Instance), CommandEr
 
 /// Puts the changed relic back in the main hand.
 fn forge_result(player: &Player, def: &ItemDef, instance: &Instance) {
-    player.set_item_in_hand(Hand::Right, Some(build_stack(def, instance, 1, &stats::current(player))));
+    let stack = build_stack(def, instance, 1, &stats::current(player));
+    if let Some(old) = player.get_item_in_hand(Hand::Right) {
+        keep_damage(&old, &stack);
+    }
+    player.set_item_in_hand(Hand::Right, Some(stack));
 }
 
 /// The number in an optional 1-based `socket` argument, as an index.
@@ -1127,11 +1150,16 @@ impl EventHandler<EntityDamageByEntityEvent> for OnHit {
             let weapon = crate::indicators::find(&server, event.damager_id as u32)
                 .filter(|_| melee)
                 .map(|(attacker, _)| stats::of_entity(&server, &attacker));
+            let mut crit = 1.0;
             if let Some(weapon) = &weapon {
                 crate::indicators::note_elements(event.entity_id as u32, items::damage_elements(weapon));
+                if let Some(multiplier) = stats::crit_multiplier(weapon, engine::random()) {
+                    crit = multiplier;
+                    crate::indicators::note_crit(event.entity_id as u32);
+                }
             }
             let multiplier = hit_multiplier(defense.as_deref(), None, weapon.as_ref(), &stats::of_entity(&server, &target));
-            event.damage = (f64::from(event.damage) * multiplier) as f32;
+            event.damage = (f64::from(event.damage) * multiplier * crit) as f32;
         }
         let attacker = server
             .get_all_players()
@@ -1245,6 +1273,11 @@ pub fn register(context: &Context) -> Result<(), String> {
             CommandNode::literal("mana").then(
                 CommandNode::argument("amount", &ArgumentType::Integer((Some(0), None))).execute(SetMana),
             ),
+        )
+        .then(
+            CommandNode::literal("admin")
+                .then(CommandNode::literal("nocd").execute(AdminNoCooldown))
+                .then(CommandNode::literal("infinite_mana").execute(AdminInfiniteMana)),
         );
     context.register_command(cmd, PERMISSION);
 

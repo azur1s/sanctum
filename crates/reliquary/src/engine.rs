@@ -13,8 +13,8 @@ use pumpkin_plugin_api::{
     wit::pumpkin::plugin::{sounds::SoundCategory, status_effect::StatusEffectInstance},
 };
 
-use crate::items::{Action, Actions, Check, Condition, ItemDef, ItemSkill, Mechanic, Num, Params, PlayerStats, Scope, Targeter, Trigger, stat_key};
-use crate::{mana, names};
+use crate::items::{Action, Actions, Check, Condition, ItemDef, Mechanic, Num, Params, PlayerStats, Scope, Targeter, Trigger, stat_key};
+use crate::{admin, mana, names};
 
 type Vec3 = (f64, f64, f64);
 
@@ -100,7 +100,7 @@ fn particle_problem(name: &str) -> Option<String> {
 const LOOKUP_RANGE: f64 = 64.0;
 
 pub fn text(s: &str) -> TextComponent {
-    TextComponent::from_legacy_string_with_code(s, '&')
+    TextComponent::from_legacy_string_with_code(&crate::items::expand_hex(s), '&')
 }
 
 pub use crate::items::cooldown_group;
@@ -146,10 +146,11 @@ pub fn try_cast(cast: &Cast, item: &ItemDef, skill_index: usize) -> bool {
         return false;
     }
     let group = cooldown_group(item, skill_index);
-    if use_.cooldown > 0.0 && cast.caster.is_on_cooldown(&group) {
+    let cooldown = if admin::no_cooldown() { 0.0 } else { use_.cooldown };
+    if cooldown > 0.0 && cast.caster.is_on_cooldown(&group) {
         if skill.trigger != Trigger::Hit {
             // get_cooldown is the fraction left, so scale by the full duration.
-            let left = (cast.caster.get_cooldown(&group) * use_.cooldown).ceil().max(1.0) as u32;
+            let left = (cast.caster.get_cooldown(&group) * cooldown).ceil().max(1.0) as u32;
             notice(&cast.caster, "cooldown", &format!("&cThis ability is on cooldown for {left}s"));
         }
         return false;
@@ -164,22 +165,17 @@ pub fn try_cast(cast: &Cast, item: &ItemDef, skill_index: usize) -> bool {
         }
     }
     let key = cast.caster.get_id().to_string();
-    if use_.mana_cost > 0 && mana::try_spend(&key, use_.mana_cost).is_none() {
+    if use_.mana_cost > 0 && !admin::infinite_mana() && mana::try_spend(&key, use_.mana_cost).is_none() {
         if skill.trigger != Trigger::Hit {
             notice(&cast.caster, "mana", "&cNot enough mana");
         }
         return false;
     }
-    if use_.cooldown > 0.0 {
-        cast.caster.start_cooldown(&group, (use_.cooldown * 20.0).round() as i32);
+    if cooldown > 0.0 {
+        cast.caster.start_cooldown(&group, (cooldown * 20.0).round() as i32);
     }
     run(cast, &skill.actions, 0, &me);
     true
-}
-
-/// Whether a skill use has a cooldown overlay worth showing on the item.
-pub fn shows_overlay(use_: &ItemSkill) -> bool {
-    use_.skill.trigger == Trigger::RightClick && use_.cooldown > 0.0
 }
 
 /// Runs `actions[from..]` with `subject` as "self".
@@ -628,6 +624,9 @@ fn apply(cast: &Cast, mechanic: &Mechanic, subject: &Subject) {
             // The target's defense for this kind and its element mix.
             let stats = crate::stats::of_entity(cast.server, e);
             total *= crate::game::hit_multiplier(kind.as_ref().and_then(|k| k.defense.as_deref()), element.as_deref(), None, &stats);
+            // A skill that costs its caster health should not crit them.
+            let crit = if e.get_id() == cast.caster.as_entity().get_id() { None } else { crate::stats::crit_multiplier(&cast.stats, random()) };
+            total *= crit.unwrap_or(1.0);
             if let (Some(living), Some(source)) = (e.as_living(), names::damage_type(source)) {
                 living.damage(total as f32, source);
                 // Skill damage has no attacker in the API, so remember it for
@@ -635,6 +634,9 @@ fn apply(cast: &Cast, mechanic: &Mechanic, subject: &Subject) {
                 crate::triggers::note_hit(e.get_id(), &cast.caster);
                 crate::indicators::note_player_damage(e.get_id(), kind.as_ref().map(|k| k.id.as_str()));
                 crate::indicators::note_elements(e.get_id(), element.iter().cloned().collect());
+                if crit.is_some() {
+                    crate::indicators::note_crit(e.get_id());
+                }
                 if *triggers_hit && !cast.from_proc && e.get_id() != cast.caster.as_entity().get_id() {
                     crate::game::proc_hit(cast.server, &cast.caster, e);
                 }

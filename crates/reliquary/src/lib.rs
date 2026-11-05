@@ -1,6 +1,7 @@
 use pumpkin_plugin_api::{Context, Plugin, PluginMetadata, permissions};
 use tracing::*;
 
+mod admin;
 mod engine;
 mod game;
 mod indicators;

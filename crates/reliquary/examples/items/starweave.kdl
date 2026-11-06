@@ -8,7 +8,7 @@
 //   speed                           percent, `speed 10` = 10% faster
 //   damage, attack-speed            main-hand items only
 // Any other stat is custom. Damage kind stats (magic-power, strength) come
-// from kinds.kdl; declare any others once, in any file, with `stat "name"`.
+// from configs/kinds.kdl; declare any others once, in any file, with `stat "name"`.
 // Custom stats add up across items, and formulas read them as `self.magic_power`.
 
 item "starweave_hood" {

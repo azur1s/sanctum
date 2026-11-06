@@ -1,5 +1,5 @@
 // Upgrade items. An item with an `upgrade "<id>"` line applies that upgrade from
-// upgrades.kdl. Hold it in your offhand and the item in your main hand, then
+// configs/upgrades.kdl. Hold it in your offhand and the item in your main hand, then
 // `/relic upgrade` uses one.
 // It does nothing else, so it can't have stats, skills or sockets of its own.
 

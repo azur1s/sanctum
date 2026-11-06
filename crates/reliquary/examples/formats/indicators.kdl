@@ -1,0 +1,13 @@
+// How floating damage numbers look. configs/config.kdl has how long they last,
+// and each kind's prefix and color are in configs/kinds.kdl. Apply changes with
+// /relic reload.
+
+// {number_color} is the color of the number itself: the kind's color, or
+// crit-color on a crit. {color} is always the kind's color. {icons} are the icons
+// of the hit's elements, {prefix} is the kind's prefix.
+number "{number_color}{icons}{color}{prefix}{number_color}{number}"
+crit-color "&6&l"
+// A kind that has no color of its own.
+kind-color "&f"
+// Damage that matches no kind.
+no-kind-color "&7"

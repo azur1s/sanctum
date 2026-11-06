@@ -6,15 +6,10 @@ use std::sync::{Arc, Mutex};
 
 use pumpkin_plugin_api::{Entity, ItemStack, Player, Server, common::Hand, world::EquipmentSlot};
 
+use crate::config;
 use crate::game;
 use crate::items::{ItemDef, PlayerStats, Slot};
 use crate::mana;
-
-/// Extra damage of a crit before items, in percent: 50 is 1.5x.
-const BASE_CRIT_POWER: f64 = 50.0;
-
-/// Every player has these before items.
-pub const BASE: &[(&str, f64)] = &[("max_mana", 100.0), ("mana_regen", 5.0), ("crit_power", BASE_CRIT_POWER)];
 
 /// Stats from the last regen tick, to notice changes.
 static LAST: Mutex<Option<HashMap<String, PlayerStats>>> = Mutex::new(None);
@@ -48,7 +43,7 @@ pub fn equipped(player: &Player) -> Vec<Source> {
 
 /// Base stats plus everything equipped.
 pub fn current(player: &Player) -> PlayerStats {
-    let mut total: PlayerStats = BASE.iter().map(|(k, v)| (k.to_string(), *v)).collect();
+    let mut total: PlayerStats = config::get().player_stats.iter().cloned().collect();
     for source in equipped(player) {
         for (stat, value) in &source.item.stats {
             *total.entry(stat.clone()).or_insert(0.0) += value;
@@ -58,10 +53,9 @@ pub fn current(player: &Player) -> PlayerStats {
 }
 
 /// What a mob's gear adds up to: each relic must be in the slot it is made for,
-/// like on a player. Crit power is a mob's only base stat, so that crit chance
-/// on its gear does something.
+/// like on a player, on top of the mob stats from `config.kdl`.
 fn of_mob(entity: &Entity) -> PlayerStats {
-    let mut total = PlayerStats::from([("crit_power".to_string(), BASE_CRIT_POWER)]);
+    let mut total: PlayerStats = config::get().mob_stats.iter().cloned().collect();
     let Some(living) = entity.as_living() else { return total };
     let slots = [
         (Slot::MainHand, EquipmentSlot::MainHand),

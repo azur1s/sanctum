@@ -10,8 +10,10 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use crate::texts::{lore, messages, msg};
+
 use super::tooltip::{self, FILL};
-use super::{ItemDef, Slot, Stats, split_stat, stat_info, stat_key};
+use super::{ItemDef, Slot, StatFormats, Stats, split_stat, stat_info, stat_key};
 
 /// A socket of this type takes every gem; a gem of this type fits every socket.
 pub const ANY_SOCKET: &str = "any";
@@ -194,21 +196,21 @@ pub fn roll_reforge(options: &[Arc<ReforgeDef>], current: Option<&str>, roll: f6
 /// Why `gem` can't go in socket `socket` of `host`, if it can't.
 pub fn gem_problem(host: &ItemDef, socket: usize, gem: &ItemDef) -> Option<String> {
     let Some(gem_type) = &gem.gem else {
-        return Some(format!("{} is not a gem.", gem.name));
+        return Some(msg(&messages::NOT_A_GEM, &[("gem", &gem.name)]));
     };
     let Some(socket_type) = host.sockets.get(socket) else {
-        return Some(format!("{} has no socket {}.", host.name, socket + 1));
+        return Some(msg(&messages::NO_SUCH_SOCKET, &[("item", &host.name), ("socket", &(socket + 1))]));
     };
     if socket_type != ANY_SOCKET && gem_type != ANY_SOCKET && socket_type != gem_type {
-        return Some(format!("{} is a {gem_type} gem; socket {} takes {socket_type}.", gem.name, socket + 1));
+        return Some(msg(&messages::WRONG_SOCKET, &[("gem", &gem.name), ("type", gem_type), ("socket", &(socket + 1)), ("takes", socket_type)]));
     }
     if let Some(stat) = gem.stats.keys().find(|s| !stat_fits(host, s)) {
-        return Some(format!("{}'s {} only works on main-hand items that have that stat.", gem.name, stat.replace('_', "-")));
+        return Some(msg(&messages::GEM_STAT_MAIN_HAND, &[("gem", &gem.name), ("stat", &stat.replace('_', "-"))]));
     }
     if host.slot != Slot::MainHand
         && let Some(skill) = gem.skills.iter().find(|s| s.skill.trigger.main_hand_only())
     {
-        return Some(format!("{}'s {} only works on main-hand items.", gem.name, skill.name));
+        return Some(msg(&messages::GEM_SKILL_MAIN_HAND, &[("gem", &gem.name), ("skill", &skill.name)]));
     }
     None
 }
@@ -245,14 +247,14 @@ pub fn link_upgrades(upgrades: Vec<UpgradeDef>, items: &BTreeMap<String, Arc<Ite
         .collect()
 }
 
-const PIP: &str = "●";
 
 /// Whether `max` pips fit on the line without widening the smallest tooltip.
 /// Shorter names leave room for more. It goes by `max`, not the count, so the
 /// pips don't vanish as an item fills up.
-fn pips_fit(name: &str, max: u32) -> bool {
-    let without_pips = format!("{name} {FILL}{max}/{max}");
-    u64::from(max) * u64::from(tooltip::text_width(PIP)) <= u64::from(tooltip::room_left(&without_pips))
+fn pips_fit(name: &str, color: &str, max: u32, formats: &StatFormats) -> bool {
+    let without_pips = formats.lore.fill(&lore::UPGRADE_BAR, &[("color", &color), ("name", &name), ("full", &""), ("empty", &""), ("fill", &FILL), ("count", &max), ("max", &max)]);
+    let pip = u64::from(tooltip::text_width(formats.lore.get(&lore::UPGRADE_PIP)));
+    u64::from(max) * pip <= u64::from(tooltip::room_left(&without_pips, formats.tooltip.min_width))
 }
 
 impl ItemDef {
@@ -303,39 +305,44 @@ impl ItemDef {
     }
 
     /// Lore lines for the upgrades, or how to use an upgrade item.
-    pub(super) fn upgrade_lines(&self) -> Vec<String> {
+    pub(super) fn upgrade_lines(&self, formats: &StatFormats) -> Vec<String> {
+        let texts = &formats.lore;
         if self.upgrade.is_some() {
-            return vec!["&8Hold in offhand: /relic upgrade".to_string()];
+            return vec![texts.fill(&lore::UPGRADE_ITEM_HINT, &[])];
         }
         self.upgrade_views
             .iter()
             .map(|view| match view {
-                UpgradeView::Active { name, color, count, max } if pips_fit(name, *max) => {
-                    let (full, empty) = (PIP.repeat(*count as usize), PIP.repeat((max - count) as usize));
-                    format!("{color}{name} {color}{full}&8{empty}{FILL}&7{count}/{max}")
+                UpgradeView::Active { name, color, count, max } if pips_fit(name, color, *max, formats) => {
+                    let pip = texts.get(&lore::UPGRADE_PIP);
+                    let (full, empty) = (pip.repeat(*count as usize), pip.repeat((max - count) as usize));
+                    texts.fill(&lore::UPGRADE_BAR, &[("color", color), ("name", name), ("full", &full), ("empty", &empty), ("fill", &FILL), ("count", count), ("max", max)])
                 }
-                UpgradeView::Active { name, color, count, max } => format!("{color}{name}{FILL}&7{count}/{max}"),
-                UpgradeView::Inactive(id) => format!("&8✖ {id} (inactive)"),
+                UpgradeView::Active { name, color, count, max } => {
+                    texts.fill(&lore::UPGRADE_SHORT, &[("color", color), ("name", name), ("fill", &FILL), ("count", count), ("max", max)])
+                }
+                UpgradeView::Inactive(id) => texts.fill(&lore::UPGRADE_INACTIVE, &[("id", id)]),
             })
             .collect()
     }
 
     /// Lore lines for the sockets, or for what kind of socket a gem fits.
-    pub(super) fn socket_lines(&self) -> Vec<String> {
+    pub(super) fn socket_lines(&self, formats: &StatFormats) -> Vec<String> {
+        let texts = &formats.lore;
         if let Some(gem) = &self.gem {
             return vec![if gem == ANY_SOCKET {
-                "&8Fits any socket".to_string()
+                texts.fill(&lore::GEM_FITS_ANY, &[])
             } else {
-                format!("&8Fits {gem} sockets")
+                texts.fill(&lore::GEM_FITS, &[("type", gem)])
             }];
         }
         self.socket_views
             .iter()
             .map(|view| match view {
-                SocketView::Empty(t) if t == ANY_SOCKET => "&8◇ Empty socket".to_string(),
-                SocketView::Empty(t) => format!("&8◇ Empty {t} socket"),
-                SocketView::Filled(name) => format!("&f◆ {name}"),
-                SocketView::Inactive(id) => format!("&8✖ {id} (inactive)"),
+                SocketView::Empty(t) if t == ANY_SOCKET => texts.fill(&lore::SOCKET_EMPTY_ANY, &[]),
+                SocketView::Empty(t) => texts.fill(&lore::SOCKET_EMPTY, &[("type", t)]),
+                SocketView::Filled(name) => texts.fill(&lore::SOCKET_FILLED, &[("gem", name)]),
+                SocketView::Inactive(id) => texts.fill(&lore::SOCKET_INACTIVE, &[("id", id)]),
             })
             .collect()
     }
@@ -734,7 +741,8 @@ mod tests {
 
     #[test]
     fn shorter_names_fit_more_pips() {
-        let most = |name: &str| (1..=200).rev().find(|&max| pips_fit(name, max)).unwrap_or(0);
+        let formats = StatFormats::default();
+        let most = |name: &str| (1..=200).rev().find(|&max| pips_fit(name, "&7", max, &formats)).unwrap_or(0);
         assert!(most("Polish") >= 10, "{}", most("Polish"));
         assert!(most("Oil") > most("Polish"));
         assert!(most("Polish") > most("Whetstone of the Long Night"));
@@ -790,10 +798,10 @@ mod tests {
 
     #[test]
     fn examples_parse() {
-        parse_upgrades("u", include_str!("../../examples/upgrades.kdl")).unwrap();
+        parse_upgrades("u", include_str!("../../examples/configs/upgrades.kdl")).unwrap();
         let upgrade_items = parse_file("i", include_str!("../../examples/items/upgrades.kdl")).unwrap();
         assert!(upgrade_items.items.iter().all(|f| f.item.upgrade.is_some()));
-        parse_reforges("r", include_str!("../../examples/reforges.kdl")).unwrap();
+        parse_reforges("r", include_str!("../../examples/configs/reforges.kdl")).unwrap();
         let gems = parse_file("g", include_str!("../../examples/items/gems.kdl")).unwrap();
         assert!(gems.items.iter().all(|f| f.item.gem.is_some()));
     }

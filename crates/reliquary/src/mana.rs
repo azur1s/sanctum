@@ -4,13 +4,12 @@
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
-/// Mana for players not seen before.
-const START: u32 = 100;
+use crate::config;
 
 static MANA: Mutex<BTreeMap<String, u32>> = Mutex::new(BTreeMap::new());
 
 pub fn get(player: &str) -> u32 {
-    *MANA.lock().unwrap().get(player).unwrap_or(&START)
+    MANA.lock().unwrap().get(player).copied().unwrap_or_else(|| config::get().start_mana)
 }
 
 pub fn set(player: &str, value: u32) {
@@ -20,7 +19,7 @@ pub fn set(player: &str, value: u32) {
 /// Takes `cost` mana if the player has enough. Returns the new amount, or None.
 pub fn try_spend(player: &str, cost: u32) -> Option<u32> {
     let mut map = MANA.lock().unwrap();
-    let mana = map.entry(player.to_string()).or_insert(START);
+    let mana = map.entry(player.to_string()).or_insert_with(|| config::get().start_mana);
     let left = mana.checked_sub(cost)?;
     *mana = left;
     Some(left)
@@ -30,7 +29,7 @@ pub fn try_spend(player: &str, cost: u32) -> Option<u32> {
 /// Returns the new amount.
 pub fn regen_by(player: &str, amount: u32, max: u32) -> u32 {
     let mut map = MANA.lock().unwrap();
-    let mana = map.entry(player.to_string()).or_insert(START);
+    let mana = map.entry(player.to_string()).or_insert_with(|| config::get().start_mana);
     *mana = (*mana + amount).min(max);
     *mana
 }

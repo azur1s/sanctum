@@ -9,6 +9,8 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use crate::texts::{Sheet, lore};
+
 pub mod expr;
 mod font_widths;
 pub mod forge;
@@ -17,7 +19,7 @@ mod tooltip;
 
 pub use expr::{Expr, Params, PlayerStats, Scope};
 pub use forge::{link_upgrades, Instance, ReforgeDef, Reforges, SocketView, UpgradeDef, UpgradeView, Upgrades};
-pub use kdl::{parse_elements, parse_file, parse_kinds, parse_rarities, parse_reforges, parse_stat_formats, parse_stats_layout, parse_upgrades};
+pub use kdl::{parse_config, parse_elements, parse_file, parse_kinds, parse_rarities, parse_reforges, parse_stat_formats, parse_stats_layout, parse_texts, parse_upgrades};
 pub use tooltip::{expand_hex, Divider, Rgb};
 
 // ---- Items ----------------------------------------------------------------------
@@ -179,6 +181,24 @@ pub struct StatFormats {
     pub element_names: BTreeMap<String, String>,
     /// Element id -> color codes, for `{color:...}`. From `elements.kdl`.
     pub element_colors: BTreeMap<String, String>,
+    /// The lore's other parts, from `lore_format.kdl`.
+    pub lore: Sheet,
+    pub tooltip: TooltipConfig,
+}
+
+/// Tooltip sizes, from `config.kdl`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TooltipConfig {
+    /// Tooltips are at least this wide, in pixels, so short items still look right.
+    pub min_width: u32,
+    /// Roughly the characters per line of wrapped lore.
+    pub wrap_width: usize,
+}
+
+impl Default for TooltipConfig {
+    fn default() -> Self {
+        TooltipConfig { min_width: 150, wrap_width: 30 }
+    }
 }
 
 /// A line or section of item lore.
@@ -238,11 +258,27 @@ fn fill_color(format: &str, element_color: Option<&str>) -> String {
 
 impl Default for StatFormats {
     fn default() -> Self {
-        StatFormats { format: "&7{name} &b{sign}{value}".into(), stats: Vec::new(), layout: LoreEntry::default_layout(), element_names: BTreeMap::new(), element_colors: BTreeMap::new() }
+        StatFormats { format: "&7{name} &b{sign}{value}".into(), stats: Vec::new(), layout: LoreEntry::default_layout(), element_names: BTreeMap::new(), element_colors: BTreeMap::new(), lore: lore::defaults(), tooltip: TooltipConfig::default() }
     }
 }
 
 impl StatFormats {
+    /// What a trigger is called in the lore.
+    fn trigger_label(&self, trigger: Trigger) -> String {
+        let key = match trigger {
+            Trigger::RightClick => &lore::TRIGGER_RIGHT_CLICK,
+            Trigger::LeftClick => &lore::TRIGGER_LEFT_CLICK,
+            Trigger::Hit => &lore::TRIGGER_HIT,
+            Trigger::Damaged => &lore::TRIGGER_DAMAGED,
+            Trigger::Kill => &lore::TRIGGER_KILL,
+            Trigger::Sneak => &lore::TRIGGER_SNEAK,
+            Trigger::Timer(seconds) => return self.lore.fill(&lore::TRIGGER_TIMER, &[("seconds", &seconds)]),
+            Trigger::Equip => &lore::TRIGGER_EQUIP,
+            Trigger::Unequip => &lore::TRIGGER_UNEQUIP,
+        };
+        self.lore.fill(key, &[])
+    }
+
     /// Lore lines for the stats without their own layout entry, in order;
     /// hidden ones are left out.
     pub fn lines(&self, stats: &Stats) -> Vec<String> {
@@ -666,7 +702,7 @@ pub fn check_stat_elements(
         }
         if !elements.elements.contains_key(element) {
             let list: Vec<&str> = elements.elements.keys().map(String::as_str).collect();
-            problems.push(format!("{at}: unknown element `{element}` (elements.kdl has: {})", list.join(", ")));
+            problems.push(format!("{at}: unknown element `{element}` (configs/elements.kdl has: {})", list.join(", ")));
         }
     }
     problems
@@ -770,9 +806,9 @@ pub fn link(
         (Some(r), _) => item.rarity = r.clone(),
         (None, Some((id, at))) => {
             let list: Vec<&str> = rarities.iter().map(|r| r.id.as_str()).collect();
-            problems.push(format!("{at}: unknown rarity `{id}` (item_rarity.kdl has: {})", list.join(", ")));
+            problems.push(format!("{at}: unknown rarity `{id}` (configs/item_rarity.kdl has: {})", list.join(", ")));
         }
-        (None, None) => problems.push(format!("item `{}`: item_rarity.kdl has no rarities", item.id)),
+        (None, None) => problems.push(format!("item `{}`: configs/item_rarity.kdl has no rarities", item.id)),
     }
     for u in uses {
         let skill = match u.skill {
@@ -821,7 +857,6 @@ pub fn link(
 // ---- Lore -------------------------------------------------------------------------
 
 /// Lore and description lines wrap at this many visible characters.
-pub const WRAP_WIDTH: usize = 30;
 
 fn is_color(c: char) -> bool {
     c.is_ascii_hexdigit()
@@ -977,6 +1012,7 @@ impl ItemDef {
         // Tooltips are as wide as their widest line, the name included.
         let width = tooltip::tooltip_width(
             lines.iter().map(Line::min_width).chain([tooltip::text_width(&self.display_name())]),
+            formats.tooltip.min_width,
         );
         lines.into_iter().map(|line| line.render(width)).collect()
     }
@@ -987,26 +1023,28 @@ impl ItemDef {
             // Placed by `lore_lines`, which knows how wide they have to be.
             LoreEntry::Divider { .. } => Vec::new(),
             LoreEntry::Rarity => {
-                let c = &self.rarity.color;
+                let (c, rarity) = (&self.rarity.color, &self.rarity.name);
                 vec![match &self.kind {
-                    Some(kind) => format!("{c}{} {kind}", self.rarity.name),
-                    None => format!("{c}{}", self.rarity.name),
+                    Some(kind) => formats.lore.fill(&lore::RARITY_KIND, &[("color", c), ("rarity", rarity), ("kind", kind)]),
+                    None => formats.lore.fill(&lore::RARITY, &[("color", c), ("rarity", rarity)]),
                 }]
             }
             LoreEntry::Lore => {
                 let no_params = Params::new();
                 let scope = Scope { params: &no_params, stats };
-                self.lore.iter().flat_map(|l| wrap(&expr::render(&format!("&7&o{l}"), scope), WRAP_WIDTH)).collect()
+                let style = formats.lore.get(&lore::LORE_STYLE);
+                self.lore.iter().flat_map(|l| wrap(&expr::render(&format!("{style}{l}"), scope), formats.tooltip.wrap_width)).collect()
             }
             LoreEntry::Stat(stat) => self.stats.get(stat).and_then(|&v| formats.line(stat, v)).into_iter().collect(),
             LoreEntry::Stats => formats.lines(&self.stats),
-            LoreEntry::Skills => self.skill_lines(stats),
-            LoreEntry::Sockets => self.socket_lines(),
-            LoreEntry::Upgrades => self.upgrade_lines(),
+            LoreEntry::Skills => self.skill_lines(stats, formats),
+            LoreEntry::Sockets => self.socket_lines(formats),
+            LoreEntry::Upgrades => self.upgrade_lines(formats),
         }
     }
 
-    fn skill_lines(&self, stats: &PlayerStats) -> Vec<String> {
+    fn skill_lines(&self, stats: &PlayerStats, formats: &StatFormats) -> Vec<String> {
+        let texts = &formats.lore;
         let c = &self.rarity.color;
         let mut lines = Vec::new();
         for skill in &self.skills {
@@ -1014,23 +1052,25 @@ impl ItemDef {
             if !lines.is_empty() {
                 lines.push(String::new());
             }
-            lines.push(format!("{c}◆ &f{} &8· &7{}", skill.name, skill.skill.trigger.label()));
+            let trigger = formats.trigger_label(skill.skill.trigger);
+            lines.push(texts.fill(&lore::SKILL_HEADER, &[("color", c), ("name", &skill.name), ("trigger", &trigger)]));
             for l in &skill.skill.description {
-                let text = expr::render(&format!("&7{l}"), scope);
-                lines.extend(wrap(&text, WRAP_WIDTH).into_iter().map(|w| format!("  {w}")));
+                let text = expr::render(&format!("{}{l}", texts.get(&lore::SKILL_DESCRIPTION_STYLE)), scope);
+                let indent = texts.get(&lore::SKILL_DESCRIPTION_INDENT);
+                lines.extend(wrap(&text, formats.tooltip.wrap_width).into_iter().map(|w| format!("{indent}{w}")));
             }
             let mut costs = Vec::new();
             if skill.mana_cost > 0 {
-                costs.push(format!("{} mana", skill.mana_cost));
+                costs.push(texts.fill(&lore::COST_MANA, &[("amount", &skill.mana_cost)]));
             }
             if skill.cooldown > 0.0 {
-                costs.push(format!("{}s cooldown", skill.cooldown));
+                costs.push(texts.fill(&lore::COST_COOLDOWN, &[("seconds", &skill.cooldown)]));
             }
             if skill.chance < 1.0 {
-                costs.push(format!("{}% chance", (skill.chance * 100.0).round()));
+                costs.push(texts.fill(&lore::COST_CHANCE, &[("percent", &(skill.chance * 100.0).round())]));
             }
             if !costs.is_empty() {
-                lines.push(format!("&8  {}", costs.join(" · ")));
+                lines.push(texts.fill(&lore::SKILL_COSTS, &[("costs", &costs.join(texts.get(&lore::COST_SEPARATOR)))]));
             }
         }
         lines

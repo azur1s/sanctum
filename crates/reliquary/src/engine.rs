@@ -14,6 +14,7 @@ use pumpkin_plugin_api::{
 };
 
 use crate::items::{Action, Actions, Check, Condition, ItemDef, Mechanic, Num, Params, PlayerStats, Scope, Targeter, Trigger, stat_key};
+use crate::texts::{messages, msg};
 use crate::{admin, mana, names};
 
 type Vec3 = (f64, f64, f64);
@@ -105,19 +106,17 @@ pub fn text(s: &str) -> TextComponent {
 
 pub use crate::items::cooldown_group;
 
-/// Minimum time between two identical denial messages to one player.
-const NOTICE_DELAY: Duration = Duration::from_secs(1);
-
 static LAST_NOTICE: Mutex<Option<HashMap<(String, &'static str), Instant>>> = Mutex::new(None);
 
-/// Tells `player` why a cast was denied, at most once per `NOTICE_DELAY` per
-/// kind, so spamming or holding right click doesn't flood the chat.
+/// Tells `player` why a cast was denied, at most once per delay per
+/// kind (`notices.delay` in `config.kdl`), so spamming or holding right click doesn't flood the chat.
 fn notice(player: &Player, kind: &'static str, msg: &str) {
     let now = Instant::now();
     let mut guard = LAST_NOTICE.lock().unwrap();
     let last = guard.get_or_insert_with(HashMap::new);
     let key = (player.get_id().to_string(), kind);
-    if last.get(&key).is_some_and(|t| now.duration_since(*t) < NOTICE_DELAY) {
+    let delay = Duration::from_secs_f64(crate::config::get().notice_delay);
+    if last.get(&key).is_some_and(|t| now.duration_since(*t) < delay) {
         return;
     }
     last.insert(key, now);
@@ -151,7 +150,7 @@ pub fn try_cast(cast: &Cast, item: &ItemDef, skill_index: usize) -> bool {
         if skill.trigger != Trigger::Hit {
             // get_cooldown is the fraction left, so scale by the full duration.
             let left = (cast.caster.get_cooldown(&group) * cooldown).ceil().max(1.0) as u32;
-            notice(&cast.caster, "cooldown", &format!("&cThis ability is on cooldown for {left}s"));
+            notice(&cast.caster, "cooldown", &msg(&messages::ON_COOLDOWN, &[("seconds", &left)]));
         }
         return false;
     }
@@ -167,7 +166,7 @@ pub fn try_cast(cast: &Cast, item: &ItemDef, skill_index: usize) -> bool {
     let key = cast.caster.get_id().to_string();
     if use_.mana_cost > 0 && !admin::infinite_mana() && mana::try_spend(&key, use_.mana_cost).is_none() {
         if skill.trigger != Trigger::Hit {
-            notice(&cast.caster, "mana", "&cNot enough mana");
+            notice(&cast.caster, "mana", &msg(&messages::NOT_ENOUGH_MANA, &[]));
         }
         return false;
     }

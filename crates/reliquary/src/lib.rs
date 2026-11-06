@@ -2,13 +2,16 @@ use pumpkin_plugin_api::{Context, Plugin, PluginMetadata, permissions};
 use tracing::*;
 
 mod admin;
+mod config;
 mod engine;
+mod files;
 mod game;
 mod indicators;
 mod items;
 mod mana;
 mod menu;
 mod stats;
+mod texts;
 mod triggers;
 mod names;
 

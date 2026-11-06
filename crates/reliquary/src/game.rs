@@ -28,15 +28,15 @@ use pumpkin_plugin_api::{
 };
 use tracing::{info, warn};
 
+use crate::config::{self, Config};
 use crate::engine::{self, Cast, text};
+use crate::files;
 use crate::items::{self, DamageKind, Elements, Instance, ItemDef, Params, PlayerStats, ReforgeDef, Reforges, Scope, Slot, StatFormats, Trigger, UpgradeDef, Upgrades, forge};
+use crate::texts::{self, Key, Sheet, Vars, messages as m, msg};
 use crate::{mana, stats};
 
 pub(crate) const NS: &str = "reliquary";
 const PERMISSION: &str = "reliquary:command.relic";
-/// How far `/relic equip` reaches, in blocks.
-const EQUIP_RANGE: f64 = 20.0;
-
 /// Written to `items/` and `skills/` when those folders do not exist yet.
 const EXAMPLES: [(&str, &str); 8] = [
     ("items/moonlit_edge.kdl", include_str!("../examples/items/moonlit_edge.kdl")),
@@ -48,27 +48,6 @@ const EXAMPLES: [(&str, &str); 8] = [
     ("skills/storm.kdl", include_str!("../examples/skills/storm.kdl")),
     ("skills/starweave.kdl", include_str!("../examples/skills/starweave.kdl")),
 ];
-
-/// Written to `kinds.kdl` when it does not exist yet.
-const KINDS_EXAMPLE: &str = include_str!("../examples/kinds.kdl");
-
-/// Written to `elements.kdl` when it does not exist yet.
-const ELEMENTS_EXAMPLE: &str = include_str!("../examples/elements.kdl");
-
-/// Written to `item_rarity.kdl` when it does not exist yet.
-const RARITY_EXAMPLE: &str = include_str!("../examples/item_rarity.kdl");
-
-/// Written to `stats_format.kdl` when it does not exist yet.
-const STATS_FORMAT_EXAMPLE: &str = include_str!("../examples/stats_format.kdl");
-
-/// Written to `stats_layout.kdl` when it does not exist yet.
-const STATS_LAYOUT_EXAMPLE: &str = include_str!("../examples/stats_layout.kdl");
-
-/// Written to `reforges.kdl` when it does not exist yet.
-const REFORGES_EXAMPLE: &str = include_str!("../examples/reforges.kdl");
-
-/// Written to `upgrades.kdl` when it does not exist yet.
-const UPGRADES_EXAMPLE: &str = include_str!("../examples/upgrades.kdl");
 
 static ITEMS: RwLock<BTreeMap<String, Arc<ItemDef>>> = RwLock::new(BTreeMap::new());
 static REFORGES: RwLock<Reforges> = RwLock::new(BTreeMap::new());
@@ -106,12 +85,40 @@ fn kdl_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) -> std::io::Result<(
     Ok(())
 }
 
-/// Loads every `.kdl` file under `skills/` and `items/` (either folder may
-/// hold items and skills), then links items to their skills. All or nothing:
-/// if anything has a problem, the current items stay and the problems are returned.
-pub fn load_items() -> Result<usize, Vec<String>> {
-    let root = data_path("");
-    let root = Path::new(&root);
+/// Reads and parses one settings file. A problem is noted and the rest of the
+/// load carries on with an empty value, so one reload reports every broken file.
+fn section<T: Default, E: std::fmt::Display>(root: &Path, path: &str, problems: &mut Vec<String>, parse: impl FnOnce(&str, &str) -> Result<T, E>) -> T {
+    let parsed = std::fs::read_to_string(root.join(path))
+        .map_err(|e| format!("{path}: {e}"))
+        .and_then(|src| parse(path, &src).map_err(|e| e.to_string()));
+    parsed.unwrap_or_else(|e| {
+        problems.push(e);
+        T::default()
+    })
+}
+
+/// Everything the plugin's files define. Nothing is in use until `install`.
+struct Loaded {
+    items: BTreeMap<String, Arc<ItemDef>>,
+    reforges: Reforges,
+    upgrades: Upgrades,
+    kinds: BTreeMap<String, DamageKind>,
+    elements: Elements,
+    formats: StatFormats,
+    config: Config,
+    messages: Sheet,
+    indicators: Sheet,
+}
+
+/// Loads the settings and every `.kdl` file under `skills/` and `items/` (either
+/// folder may hold items and skills), then links items to their skills. Files
+/// from older versions move to their new place first, and missing files are
+/// written with their defaults.
+fn load_all(root: &Path) -> Result<Loaded, Vec<String>> {
+    for line in files::migrate(root).map_err(|e| vec![e])? {
+        info!("{line}");
+    }
+    files::write_defaults(root).map_err(|e| vec![e])?;
     for folder in ["items", "skills"] {
         let dir = root.join(folder);
         if dir.exists() {
@@ -138,121 +145,42 @@ pub fn load_items() -> Result<usize, Vec<String>> {
     let mut declared = std::collections::BTreeSet::new();
     let mut problems = Vec::new();
 
-    // Damage kinds live in one file, written with the defaults if missing.
-    let kinds_path = root.join("kinds.kdl");
-    if !kinds_path.exists() {
-        std::fs::write(&kinds_path, KINDS_EXAMPLE).map_err(|e| vec![format!("kinds.kdl: {e}")])?;
-    }
-    let kinds: BTreeMap<String, DamageKind> = match std::fs::read_to_string(&kinds_path)
-        .map_err(|e| format!("kinds.kdl: {e}"))
-        .and_then(|src| items::parse_kinds("kinds.kdl", &src).map_err(|e| e.to_string()))
-    {
-        Ok(list) => list.into_iter().map(|k| (k.id.clone(), k)).collect(),
-        Err(e) => {
-            problems.push(e);
-            BTreeMap::new()
-        }
-    };
+    let (config, config_refs): (Config, _) = section(root, "configs/config.kdl", &mut problems, items::parse_config);
+    let messages = section(root, texts::messages::PATH, &mut problems, |_, src| texts::messages::parse(src));
+    let lore = section(root, texts::lore::PATH, &mut problems, |_, src| texts::lore::parse(src));
+    let indicators = section(root, texts::indicators::PATH, &mut problems, |_, src| texts::indicators::parse(src));
+
+    let kinds: BTreeMap<String, DamageKind> = section(root, "configs/kinds.kdl", &mut problems, items::parse_kinds)
+        .into_iter()
+        .map(|k| (k.id.clone(), k))
+        .collect();
     for kind in kinds.values() {
         // A kind's power stat counts as declared.
         declared.extend(kind.power.iter().chain(&kind.defense).filter(|s| items::stat_info(s).is_none()).cloned());
         if crate::names::damage_type(&kind.source).is_none() {
-            problems.push(format!("kinds.kdl: kind `{}` has unknown source `{}`", kind.id, kind.source));
+            problems.push(format!("configs/kinds.kdl: kind `{}` has unknown source `{}`", kind.id, kind.source));
         }
     }
     // Elements, and the stats that can be tagged with one.
-    let elements_path = root.join("elements.kdl");
-    if !elements_path.exists() {
-        std::fs::write(&elements_path, ELEMENTS_EXAMPLE).map_err(|e| vec![format!("elements.kdl: {e}")])?;
-    }
-    let elements = match std::fs::read_to_string(&elements_path)
-        .map_err(|e| format!("elements.kdl: {e}"))
-        .and_then(|src| items::parse_elements("elements.kdl", &src).map_err(|e| e.to_string()))
-    {
-        Ok(elements) => elements,
-        Err(e) => {
-            problems.push(e);
-            Elements::default()
-        }
-    };
+    let elements: Elements = section(root, "configs/elements.kdl", &mut problems, items::parse_elements);
     let mut taggable: std::collections::BTreeSet<String> = ["damage", "defense"].map(String::from).into();
     taggable.extend(kinds.values().flat_map(|k| k.power.iter().chain(&k.defense)).cloned());
     // Rarities too, in file order (the first is the default).
-    let rarity_path = root.join("item_rarity.kdl");
-    if !rarity_path.exists() {
-        std::fs::write(&rarity_path, RARITY_EXAMPLE).map_err(|e| vec![format!("item_rarity.kdl: {e}")])?;
-    }
-    let rarities: Vec<Arc<items::RarityDef>> = match std::fs::read_to_string(&rarity_path)
-        .map_err(|e| format!("item_rarity.kdl: {e}"))
-        .and_then(|src| items::parse_rarities("item_rarity.kdl", &src).map_err(|e| e.to_string()))
-    {
-        Ok(list) => list.into_iter().map(Arc::new).collect(),
-        Err(e) => {
-            problems.push(e);
-            Vec::new()
-        }
-    };
-    // How stats look in lore.
-    let formats_path = root.join("stats_format.kdl");
-    if !formats_path.exists() {
-        std::fs::write(&formats_path, STATS_FORMAT_EXAMPLE).map_err(|e| vec![format!("stats_format.kdl: {e}")])?;
-    }
-    let (mut formats, mut format_refs) = match std::fs::read_to_string(&formats_path)
-        .map_err(|e| format!("stats_format.kdl: {e}"))
-        .and_then(|src| items::parse_stat_formats("stats_format.kdl", &src).map_err(|e| e.to_string()))
-    {
-        Ok(parsed) => parsed,
-        Err(e) => {
-            problems.push(e);
-            Default::default()
-        }
-    };
-    // What the lore shows, in order.
-    let layout_path = root.join("stats_layout.kdl");
-    if !layout_path.exists() {
-        std::fs::write(&layout_path, STATS_LAYOUT_EXAMPLE).map_err(|e| vec![format!("stats_layout.kdl: {e}")])?;
-    }
-    match std::fs::read_to_string(&layout_path)
-        .map_err(|e| format!("stats_layout.kdl: {e}"))
-        .and_then(|src| items::parse_stats_layout("stats_layout.kdl", &src).map_err(|e| e.to_string()))
-    {
-        Ok((layout, refs)) => {
-            formats.layout = layout;
-            format_refs.extend(refs);
-        }
-        Err(e) => problems.push(e),
-    }
-    // Reforges.
-    let reforges_path = root.join("reforges.kdl");
-    if !reforges_path.exists() {
-        std::fs::write(&reforges_path, REFORGES_EXAMPLE).map_err(|e| vec![format!("reforges.kdl: {e}")])?;
-    }
-    let (reforges, reforge_stats) = match std::fs::read_to_string(&reforges_path)
-        .map_err(|e| format!("reforges.kdl: {e}"))
-        .and_then(|src| items::parse_reforges("reforges.kdl", &src).map_err(|e| e.to_string()))
-    {
-        Ok(parsed) => parsed,
-        Err(e) => {
-            problems.push(e);
-            Default::default()
-        }
-    };
+    let rarities: Vec<Arc<items::RarityDef>> = section(root, "configs/item_rarity.kdl", &mut problems, items::parse_rarities)
+        .into_iter()
+        .map(Arc::new)
+        .collect();
+    // How stats look in lore, and what the lore shows, in order.
+    let (mut formats, mut format_refs): (StatFormats, Vec<_>) = section(root, "formats/stats_format.kdl", &mut problems, items::parse_stat_formats);
+    let (layout, layout_refs): (Vec<_>, Vec<_>) = section(root, "formats/stats_layout.kdl", &mut problems, items::parse_stats_layout);
+    formats.layout = layout;
+    format_refs.extend(layout_refs);
+    format_refs.extend(config_refs);
+    formats.lore = lore;
+    formats.tooltip = config.tooltip;
+    let (reforges, reforge_stats): (Vec<_>, Vec<_>) = section(root, "configs/reforges.kdl", &mut problems, items::parse_reforges);
     let reforges: Reforges = reforges.into_iter().map(|r| (r.id.clone(), Arc::new(r))).collect();
-    // Upgrades.
-    let upgrades_path = root.join("upgrades.kdl");
-    if !upgrades_path.exists() {
-        std::fs::write(&upgrades_path, UPGRADES_EXAMPLE).map_err(|e| vec![format!("upgrades.kdl: {e}")])?;
-    }
-    let (upgrades, upgrade_stats, upgrade_inherited) = match std::fs::read_to_string(&upgrades_path)
-        .map_err(|e| format!("upgrades.kdl: {e}"))
-        .and_then(|src| items::parse_upgrades("upgrades.kdl", &src).map_err(|e| e.to_string()))
-    {
-        Ok(parsed) => parsed,
-        Err(e) => {
-            problems.push(e);
-            Default::default()
-        }
-    };
+    let (upgrades, upgrade_stats, upgrade_inherited): (Vec<_>, Vec<_>, Vec<_>) = section(root, "configs/upgrades.kdl", &mut problems, items::parse_upgrades);
     for path in files {
         let shown = path.strip_prefix(root).unwrap_or(&path).display().to_string().replace('\\', "/");
         let parsed = std::fs::read_to_string(&path)
@@ -319,7 +247,7 @@ pub fn load_items() -> Result<usize, Vec<String>> {
             && !upgrades.contains_key(id)
         {
             let list: Vec<&str> = upgrades.keys().map(String::as_str).collect();
-            problems.push(format!("item `{}`: unknown upgrade `{id}` (upgrades.kdl has: {})", def.id, list.join(", ")));
+            problems.push(format!("item `{}`: unknown upgrade `{id}` (configs/upgrades.kdl has: {})", def.id, list.join(", ")));
         }
     }
     // `self.<stat>` must be a stat that exists (a typo otherwise reads 0).
@@ -347,14 +275,19 @@ pub fn load_items() -> Result<usize, Vec<String>> {
     for (kind, at) in kind_refs {
         if !kinds.contains_key(&kind) {
             let list: Vec<&str> = kinds.keys().map(String::as_str).collect();
-            problems.push(format!("{at}: unknown damage kind `{kind}` (kinds.kdl has: {})", list.join(", ")));
+            problems.push(format!("{at}: unknown damage kind `{kind}` (configs/kinds.kdl has: {})", list.join(", ")));
         }
     }
     if !problems.is_empty() {
         return Err(problems);
     }
-    let count = set.len();
-    *ITEMS.write().unwrap() = set;
+    Ok(Loaded { items: set, reforges, upgrades, kinds, elements, formats, config, messages, indicators })
+}
+
+/// Puts everything into use at once.
+fn install(loaded: Loaded) {
+    let Loaded { items, reforges, upgrades, kinds, elements, mut formats, config, messages, indicators } = loaded;
+    *ITEMS.write().unwrap() = items;
     *REFORGES.write().unwrap() = reforges;
     *UPGRADES.write().unwrap() = upgrades;
     *KINDS.write().unwrap() = kinds;
@@ -362,6 +295,17 @@ pub fn load_items() -> Result<usize, Vec<String>> {
     formats.element_colors = elements.elements.values().map(|e| (e.id.clone(), e.color.clone())).collect();
     *ELEMENTS.write().unwrap() = Some(Arc::new(elements));
     *STAT_FORMATS.write().unwrap() = Some(Arc::new(formats));
+    config::install(config);
+    texts::install(messages, indicators);
+}
+
+/// Loads everything from the data folder. All or nothing: if anything has a
+/// problem, what is in use stays and the problems are returned.
+pub fn load_items() -> Result<usize, Vec<String>> {
+    let root = data_path("");
+    let loaded = load_all(Path::new(&root))?;
+    let count = loaded.items.len();
+    install(loaded);
     Ok(count)
 }
 
@@ -402,7 +346,7 @@ pub(crate) fn kind_for_source(source: &str) -> Option<DamageKind> {
 }
 
 fn load_mana() {
-    let path = data_path("mana.toml");
+    let path = data_path(files::MANA);
     match std::fs::read_to_string(&path) {
         Ok(s) => match mana::load(&s) {
             Ok(n) => info!("loaded mana for {n} player(s)"),
@@ -413,8 +357,13 @@ fn load_mana() {
 }
 
 pub fn save_mana() {
-    let path = data_path("mana.toml");
-    let result = mana::save().and_then(|s| std::fs::write(&path, s).map_err(|e| e.to_string()));
+    let path = data_path(files::MANA);
+    let result = mana::save().and_then(|s| {
+        if let Some(parent) = Path::new(&path).parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        std::fs::write(&path, s).map_err(|e| e.to_string())
+    });
     if let Err(e) = result {
         warn!("could not save {path}: {e}");
     }
@@ -639,10 +588,13 @@ fn max_mana(stats: &PlayerStats) -> u32 {
 }
 
 fn show_mana(player: &Player, mana: u32, max: u32) {
+    if !config::get().mana_bar {
+        return;
+    }
     if crate::admin::infinite_mana() {
-        player.show_actionbar(text("&b✦ Mana ∞"));
+        player.show_actionbar(text(&msg(&m::MANA_BAR_INFINITE, &[])));
     } else {
-        player.show_actionbar(text(&format!("&b✦ Mana {mana}/{max}")));
+        player.show_actionbar(text(&msg(&m::MANA_BAR, &[("mana", &mana), ("max", &max)])));
     }
 }
 
@@ -708,8 +660,17 @@ fn fire_held(server: &Server, player: Player, other: Option<Entity>, trigger: Tr
 
 // ---- Commands -------------------------------------------------------------------
 
-fn fail(msg: &str) -> CommandError {
-    CommandError::CommandFailed(text(&format!("&c{msg}")))
+fn fail(key: &Key, vars: Vars) -> CommandError {
+    fail_text(&msg(key, vars))
+}
+
+/// For messages that are filled in already.
+fn fail_text(message: &str) -> CommandError {
+    CommandError::CommandFailed(text(message))
+}
+
+fn say(sender: &CommandSender, key: &Key, vars: Vars) {
+    sender.send_message(text(&msg(key, vars)));
 }
 
 /// All items, sorted by id.
@@ -720,9 +681,9 @@ pub(crate) fn all_items() -> Vec<Arc<ItemDef>> {
 /// Puts one of item `id` into the first free main inventory slot.
 /// Returns the item's display name.
 pub(crate) fn give(player: &Player, id: &str) -> Result<String, String> {
-    let def = item(id).ok_or_else(|| format!("Unknown item '{id}'. Try /relic list."))?;
+    let def = item(id).ok_or_else(|| msg(&m::UNKNOWN_ITEM, &[("id", &id)]))?;
     let inv = player.get_inventory().as_inventory();
-    let slot = (0..36).find(|&s| inv.get_item(s).is_none()).ok_or("Inventory full.")?;
+    let slot = (0..36).find(|&s| inv.get_item(s).is_none()).ok_or_else(|| msg(&m::INVENTORY_FULL, &[]))?;
     put_item(player, slot, build_stack(&def, &Instance::default(), 1, &stats::current(player)));
     Ok(def.display_name())
 }
@@ -730,9 +691,9 @@ pub(crate) fn give(player: &Player, id: &str) -> Result<String, String> {
 /// The player named in the `player` argument, or the sender.
 fn target_player(sender: &CommandSender, args: &ConsumedArgs) -> Result<Player, CommandError> {
     if let Arg::Players(mut players) = args.get_value("player") {
-        return players.pop().ok_or_else(|| fail("No player found."));
+        return players.pop().ok_or_else(|| fail(&m::NO_PLAYER_FOUND, &[]));
     }
-    sender.as_player().ok_or_else(|| fail("Name a player when using this from the console."))
+    sender.as_player().ok_or_else(|| fail(&m::NAME_A_PLAYER, &[]))
 }
 
 /// `/relic stats [player]`: totals and which item gives what.
@@ -742,20 +703,13 @@ impl CommandHandler for StatsCmd {
         let player = target_player(&sender, &args)?;
         let total = stats::current(&player);
         let key = player_key(&player);
-        sender.send_message(text(&format!(
-            "&e{}'s stats &7(mana {}/{})",
-            player.get_name(),
-            mana::get(&key),
-            max_mana(&total)
-        )));
+        say(&sender, &m::STATS_HEADER, &[("player", &player.get_name()), ("mana", &mana::get(&key)), ("max", &max_mana(&total))]);
         for (stat, value) in &total {
-            sender.send_message(text(&format!("&7- {stat}: &f{}", items::expr::format_number(*value))));
+            say(&sender, &m::STATS_LINE, &[("stat", stat), ("value", &items::expr::format_number(*value))]);
         }
-        sender.send_message(text("&eFrom:"));
-        sender.send_message(text(&format!(
-            "&7- base: {}",
-            stats::BASE.iter().map(|(k, v)| format!("{k} {v}")).collect::<Vec<_>>().join(", ")
-        )));
+        say(&sender, &m::STATS_FROM, &[]);
+        let base = config::get().player_stats.iter().map(|(k, v)| format!("{k} {v}")).collect::<Vec<_>>().join(", ");
+        say(&sender, &m::STATS_BASE, &[("stats", &base)]);
         for source in stats::equipped(&player) {
             let list: Vec<String> = source
                 .item
@@ -763,8 +717,8 @@ impl CommandHandler for StatsCmd {
                 .iter()
                 .map(|(k, v)| format!("{k} {}", items::expr::format_number(*v)))
                 .collect();
-            let list = if list.is_empty() { "no stats".to_string() } else { list.join(", ") };
-            sender.send_message(text(&format!("&7- {:?}: {} &7{list}", source.slot, source.item.display_name())));
+            let list = if list.is_empty() { msg(&m::STATS_NONE, &[]) } else { list.join(", ") };
+            say(&sender, &m::STATS_SOURCE, &[("slot", &format!("{:?}", source.slot)), ("item", &source.item.display_name()), ("stats", &list)]);
         }
         Ok(1)
     }
@@ -774,15 +728,15 @@ impl CommandHandler for StatsCmd {
 struct Eval;
 impl CommandHandler for Eval {
     fn handle(&self, sender: CommandSender, _: Server, args: ConsumedArgs) -> Result<i32, CommandError> {
-        let player = sender.as_player().ok_or_else(|| fail("Only players can use this."))?;
+        let player = sender.as_player().ok_or_else(|| fail(&m::ONLY_PLAYERS, &[]))?;
         let src = match args.get_value("formula") {
             Arg::Simple(s) | Arg::Msg(s) => s,
-            _ => return Err(fail("Missing formula.")),
+            _ => return Err(fail(&m::MISSING_FORMULA, &[])),
         };
-        let e = items::expr::parse(&src).map_err(|e| fail(&format!("at {}: {}", e.at + 1, e.message)))?;
+        let e = items::expr::parse(&src).map_err(|e| fail(&m::FORMULA_ERROR, &[("at", &(e.at + 1)), ("error", &e.message)]))?;
         let (params, stats) = (Params::new(), stats::for_cast(&player));
         let value = e.eval(Scope { params: &params, stats: &stats });
-        sender.send_message(text(&format!("&7{src} &f= &b{value}")));
+        say(&sender, &m::FORMULA_RESULT, &[("formula", &src), ("value", &value)]);
         Ok(1)
     }
 }
@@ -791,13 +745,13 @@ impl CommandHandler for Eval {
 struct SetMana;
 impl CommandHandler for SetMana {
     fn handle(&self, sender: CommandSender, _: Server, args: ConsumedArgs) -> Result<i32, CommandError> {
-        let player = sender.as_player().ok_or_else(|| fail("Only players can use this."))?;
+        let player = sender.as_player().ok_or_else(|| fail(&m::ONLY_PLAYERS, &[]))?;
         let Arg::Num(Ok(n)) = args.get_value("amount") else {
-            return Err(fail("Expected a whole number."));
+            return Err(fail(&m::WHOLE_NUMBER, &[]));
         };
         let amount = match n {
             pumpkin_plugin_api::command_wit::Number::Int32(i) => i.max(0) as u32,
-            _ => return Err(fail("Expected a whole number.")),
+            _ => return Err(fail(&m::WHOLE_NUMBER, &[])),
         };
         let max = max_mana(&stats::current(&player));
         mana::set(&player_key(&player), amount.min(max));
@@ -806,8 +760,8 @@ impl CommandHandler for SetMana {
     }
 }
 
-fn on_off(enabled: bool) -> &'static str {
-    if enabled { "&aON" } else { "&cOFF" }
+fn on_off(enabled: bool) -> String {
+    msg(if enabled { &m::STATE_ON } else { &m::STATE_OFF }, &[])
 }
 
 /// `/relic admin nocd`: toggles ability cooldowns off for everyone.
@@ -815,7 +769,7 @@ struct AdminNoCooldown;
 impl CommandHandler for AdminNoCooldown {
     fn handle(&self, sender: CommandSender, _: Server, _: ConsumedArgs) -> Result<i32, CommandError> {
         let enabled = crate::admin::toggle_no_cooldown();
-        sender.send_message(text(&format!("&eNo cooldowns: {}", on_off(enabled))));
+        say(&sender, &m::ADMIN_NO_COOLDOWNS, &[("state", &on_off(enabled))]);
         Ok(1)
     }
 }
@@ -825,7 +779,7 @@ struct AdminInfiniteMana;
 impl CommandHandler for AdminInfiniteMana {
     fn handle(&self, sender: CommandSender, _: Server, _: ConsumedArgs) -> Result<i32, CommandError> {
         let enabled = crate::admin::toggle_infinite_mana();
-        sender.send_message(text(&format!("&eInfinite mana: {}", on_off(enabled))));
+        say(&sender, &m::ADMIN_INFINITE_MANA, &[("state", &on_off(enabled))]);
         Ok(1)
     }
 }
@@ -833,12 +787,12 @@ impl CommandHandler for AdminInfiniteMana {
 struct Give;
 impl CommandHandler for Give {
     fn handle(&self, sender: CommandSender, _: Server, args: ConsumedArgs) -> Result<i32, CommandError> {
-        let player = sender.as_player().ok_or_else(|| fail("Only players can use this."))?;
+        let player = sender.as_player().ok_or_else(|| fail(&m::ONLY_PLAYERS, &[]))?;
         let Arg::Simple(id) = args.get_value("id") else {
-            return Err(fail("Missing item id."));
+            return Err(fail(&m::MISSING_ITEM_ID, &[]));
         };
-        let name = give(&player, &id).map_err(|e| fail(&e))?;
-        sender.send_message(text(&format!("&aGave {name}")));
+        let name = give(&player, &id).map_err(|e| fail_text(&e))?;
+        say(&sender, &m::GAVE, &[("item", &name)]);
         Ok(1)
     }
 }
@@ -848,13 +802,13 @@ impl CommandHandler for Give {
 struct Equip;
 impl CommandHandler for Equip {
     fn handle(&self, sender: CommandSender, _: Server, args: ConsumedArgs) -> Result<i32, CommandError> {
-        let player = sender.as_player().ok_or_else(|| fail("Only players can use this."))?;
+        let player = sender.as_player().ok_or_else(|| fail(&m::ONLY_PLAYERS, &[]))?;
         let Arg::Simple(id) = args.get_value("id") else {
-            return Err(fail("Missing item id."));
+            return Err(fail(&m::MISSING_ITEM_ID, &[]));
         };
-        let def = item(&id).filter(|d| d.is_relic()).ok_or_else(|| fail(&format!("No relic `{id}`.")))?;
-        let hit = player.ray_trace_entity(EQUIP_RANGE).ok_or_else(|| fail("Look at a mob first."))?;
-        let living = hit.entity.as_living().filter(|l| l.is_mob()).ok_or_else(|| fail("Look at a mob first."))?;
+        let def = item(&id).filter(|d| d.is_relic()).ok_or_else(|| fail(&m::NO_RELIC, &[("id", &id)]))?;
+        let hit = player.ray_trace_entity(config::get().equip_range).ok_or_else(|| fail(&m::LOOK_AT_MOB, &[]))?;
+        let living = hit.entity.as_living().filter(|l| l.is_mob()).ok_or_else(|| fail(&m::LOOK_AT_MOB, &[]))?;
         let slot = match def.slot {
             Slot::MainHand => EquipmentSlot::MainHand,
             Slot::OffHand => EquipmentSlot::OffHand,
@@ -864,7 +818,7 @@ impl CommandHandler for Equip {
             Slot::Feet => EquipmentSlot::Feet,
         };
         living.set_equipment(slot, Some(build_stack(&def, &Instance::default(), 1, &PlayerStats::new())));
-        sender.send_message(text(&format!("&aPut {} on the mob ({:?})", def.display_name(), def.slot)));
+        say(&sender, &m::EQUIPPED_MOB, &[("item", &def.display_name()), ("slot", &format!("{:?}", def.slot))]);
         Ok(1)
     }
 }
@@ -872,7 +826,7 @@ impl CommandHandler for Equip {
 struct Menu;
 impl CommandHandler for Menu {
     fn handle(&self, sender: CommandSender, _: Server, _: ConsumedArgs) -> Result<i32, CommandError> {
-        let player = sender.as_player().ok_or_else(|| fail("Only players can use this."))?;
+        let player = sender.as_player().ok_or_else(|| fail(&m::ONLY_PLAYERS, &[]))?;
         crate::menu::open(&player, 0);
         Ok(1)
     }
@@ -885,9 +839,9 @@ impl CommandHandler for List {
             .read()
             .unwrap()
             .values()
-            .map(|def| format!("&7- &f{} &7({})", def.id, def.display_name()))
+            .map(|def| msg(&m::LIST_LINE, &[("id", &def.id), ("item", &def.display_name())]))
             .collect();
-        sender.send_message(text(&format!("&eItems ({}):", lines.len())));
+        say(&sender, &m::LIST_HEADER, &[("count", &lines.len())]);
         for line in lines {
             sender.send_message(text(&line));
         }
@@ -904,14 +858,14 @@ impl CommandHandler for Reload {
                     refresh_inventory(&player);
                 }
                 info!("reloaded {n} item(s)");
-                sender.send_message(text(&format!("&aReloaded {n} item(s).")));
+                say(&sender, &m::RELOADED, &[("count", &n)]);
                 Ok(1)
             }
             Err(problems) => {
-                sender.send_message(text(&format!("&cReload failed, kept the old items ({} problem(s)):", problems.len())));
+                say(&sender, &m::RELOAD_FAILED, &[("count", &problems.len())]);
                 for problem in &problems {
                     warn!("{problem}");
-                    sender.send_message(text(&format!("&7- {problem}")));
+                    say(&sender, &m::RELOAD_PROBLEM, &[("problem", problem)]);
                 }
                 Ok(0)
             }
@@ -921,16 +875,16 @@ impl CommandHandler for Reload {
 
 /// The relic in the main hand, to change: its definition and what it has on it.
 fn held_for_forge(player: &Player) -> Result<(Arc<ItemDef>, Instance), CommandError> {
-    let stack = player.get_item_in_hand(Hand::Right).ok_or_else(|| fail("Hold an item in your main hand."))?;
+    let stack = player.get_item_in_hand(Hand::Right).ok_or_else(|| fail(&m::HOLD_ITEM, &[]))?;
     let def = stack
         .get_string(NS, "id")
         .and_then(|id| item(&id))
-        .ok_or_else(|| fail("That isn't a Reliquary item."))?;
+        .ok_or_else(|| fail(&m::NOT_RELIQUARY_ITEM, &[]))?;
     if !def.is_relic() {
-        return Err(fail("Hold the item you want to change, not a gem or upgrade."));
+        return Err(fail(&m::HOLD_RELIC, &[]));
     }
     if stack.get_count() != 1 {
-        return Err(fail("Hold just one of it."));
+        return Err(fail(&m::HOLD_ONE, &[]));
     }
     Ok((def, instance_of(&stack)))
 }
@@ -956,23 +910,23 @@ fn socket_arg(args: &ConsumedArgs) -> Option<usize> {
 struct Reforge;
 impl CommandHandler for Reforge {
     fn handle(&self, sender: CommandSender, _: Server, args: ConsumedArgs) -> Result<i32, CommandError> {
-        let player = sender.as_player().ok_or_else(|| fail("Only players can use this."))?;
+        let player = sender.as_player().ok_or_else(|| fail(&m::ONLY_PLAYERS, &[]))?;
         let (def, mut instance) = held_for_forge(&player)?;
         if !def.reforgeable {
-            return Err(fail(&format!("{} can't be reforged.", def.name)));
+            return Err(fail(&m::CANT_REFORGE, &[("item", &def.name)]));
         }
         let options: Vec<Arc<ReforgeDef>> = REFORGES.read().unwrap().values().filter(|r| r.fits(&def)).cloned().collect();
         let chosen = match args.get_value("id") {
             Arg::Simple(id) if !id.is_empty() => options.iter().find(|r| r.id == id).cloned().ok_or_else(|| {
                 let list: Vec<&str> = options.iter().map(|r| r.id.as_str()).collect();
-                fail(&format!("'{id}' doesn't fit {}. Fits: {}", def.name, list.join(", ")))
+                fail(&m::REFORGE_DOESNT_FIT, &[("id", &id), ("item", &def.name), ("fits", &list.join(", "))])
             })?,
             _ => forge::roll_reforge(&options, instance.reforge.as_deref(), engine::random())
-                .ok_or_else(|| fail(&format!("No reforge fits {}.", def.name)))?,
+                .ok_or_else(|| fail(&m::NO_REFORGE_FITS, &[("item", &def.name)]))?,
         };
         instance.reforge = Some(chosen.id.clone());
         forge_result(&player, &def, &instance);
-        sender.send_message(text(&format!("&aReforged into {}{} {}", def.rarity.color, chosen.name, def.name)));
+        say(&sender, &m::REFORGED, &[("color", &def.rarity.color), ("reforge", &chosen.name), ("item", &def.name)]);
         Ok(1)
     }
 }
@@ -981,33 +935,33 @@ impl CommandHandler for Reforge {
 struct Socket;
 impl CommandHandler for Socket {
     fn handle(&self, sender: CommandSender, _: Server, args: ConsumedArgs) -> Result<i32, CommandError> {
-        let player = sender.as_player().ok_or_else(|| fail("Only players can use this."))?;
+        let player = sender.as_player().ok_or_else(|| fail(&m::ONLY_PLAYERS, &[]))?;
         let (def, mut instance) = held_for_forge(&player)?;
         if def.sockets.is_empty() {
-            return Err(fail(&format!("{} has no sockets.", def.name)));
+            return Err(fail(&m::NO_SOCKETS, &[("item", &def.name)]));
         }
-        let off_hand = player.get_inventory().get_off_hand().ok_or_else(|| fail("Hold a gem in your offhand."))?;
+        let off_hand = player.get_inventory().get_off_hand().ok_or_else(|| fail(&m::HOLD_GEM, &[]))?;
         let gem = off_hand
             .get_string(NS, "id")
             .and_then(|id| item(&id))
             .filter(|d| d.gem.is_some())
-            .ok_or_else(|| fail("Hold a gem in your offhand."))?;
+            .ok_or_else(|| fail(&m::HOLD_GEM, &[]))?;
 
         let socket = match socket_arg(&args) {
             Some(socket) => {
                 if instance.gem(socket).is_some() {
-                    return Err(fail(&format!("Socket {} is taken. Use /relic unsocket {} first.", socket + 1, socket + 1)));
+                    return Err(fail(&m::SOCKET_TAKEN, &[("socket", &(socket + 1))]));
                 }
                 if let Some(problem) = forge::gem_problem(&def, socket, &gem) {
-                    return Err(fail(&problem));
+                    return Err(fail_text(&problem));
                 }
                 socket
             }
             None => {
                 let mut free = (0..def.sockets.len()).filter(|&s| instance.gem(s).is_none()).peekable();
-                let first = *free.peek().ok_or_else(|| fail(&format!("Every socket on {} is taken.", def.name)))?;
+                let first = *free.peek().ok_or_else(|| fail(&m::SOCKETS_FULL, &[("item", &def.name)]))?;
                 free.find(|&s| forge::gem_problem(&def, s, &gem).is_none()).ok_or_else(|| {
-                    fail(&forge::gem_problem(&def, first, &gem).unwrap_or_default())
+                    fail_text(&forge::gem_problem(&def, first, &gem).unwrap_or_default())
                 })?
             }
         };
@@ -1017,7 +971,7 @@ impl CommandHandler for Socket {
         let left = off_hand.get_count().saturating_sub(1);
         let rest = (left > 0).then(|| build_stack(&gem, &Instance::default(), left, &stats::current(&player)));
         player.set_item_in_hand(Hand::Left, rest);
-        sender.send_message(text(&format!("&aSocketed {} &ainto socket {}", gem.display_name(), socket + 1)));
+        say(&sender, &m::SOCKETED, &[("gem", &gem.display_name()), ("socket", &(socket + 1))]);
         Ok(1)
     }
 }
@@ -1027,21 +981,21 @@ impl CommandHandler for Socket {
 struct Unsocket;
 impl CommandHandler for Unsocket {
     fn handle(&self, sender: CommandSender, _: Server, args: ConsumedArgs) -> Result<i32, CommandError> {
-        let player = sender.as_player().ok_or_else(|| fail("Only players can use this."))?;
+        let player = sender.as_player().ok_or_else(|| fail(&m::ONLY_PLAYERS, &[]))?;
         let (def, mut instance) = held_for_forge(&player)?;
         let socket = match socket_arg(&args) {
             Some(socket) => socket,
-            None => instance.gems.iter().rposition(Option::is_some).ok_or_else(|| fail("No gems to take out."))?,
+            None => instance.gems.iter().rposition(Option::is_some).ok_or_else(|| fail(&m::NO_GEMS, &[]))?,
         };
-        let id = instance.gem(socket).ok_or_else(|| fail(&format!("Socket {} is empty.", socket + 1)))?.to_string();
-        let gem = item(&id).ok_or_else(|| fail(&format!("Gem '{id}' no longer exists, so it can't come out. Restore its definition.")))?;
+        let id = instance.gem(socket).ok_or_else(|| fail(&m::SOCKET_EMPTY, &[("socket", &(socket + 1))]))?.to_string();
+        let gem = item(&id).ok_or_else(|| fail(&m::GEM_GONE, &[("id", &id)]))?;
 
         let inv = player.get_inventory().as_inventory();
-        let slot = (0..36).find(|&s| inv.get_item(s).is_none()).ok_or_else(|| fail("Inventory full."))?;
+        let slot = (0..36).find(|&s| inv.get_item(s).is_none()).ok_or_else(|| fail(&m::INVENTORY_FULL, &[]))?;
         instance.set_gem(socket, None);
         forge_result(&player, &def, &instance);
         put_item(&player, slot, build_stack(&gem, &Instance::default(), 1, &stats::current(&player)));
-        sender.send_message(text(&format!("&aTook {} &aout of socket {}", gem.display_name(), socket + 1)));
+        say(&sender, &m::UNSOCKETED, &[("gem", &gem.display_name()), ("socket", &(socket + 1))]);
         Ok(1)
     }
 }
@@ -1050,21 +1004,21 @@ impl CommandHandler for Unsocket {
 struct Upgrade;
 impl CommandHandler for Upgrade {
     fn handle(&self, sender: CommandSender, _: Server, _: ConsumedArgs) -> Result<i32, CommandError> {
-        let player = sender.as_player().ok_or_else(|| fail("Only players can use this."))?;
+        let player = sender.as_player().ok_or_else(|| fail(&m::ONLY_PLAYERS, &[]))?;
         let (def, mut instance) = held_for_forge(&player)?;
-        let off_hand = player.get_inventory().get_off_hand().ok_or_else(|| fail("Hold an upgrade in your offhand."))?;
+        let off_hand = player.get_inventory().get_off_hand().ok_or_else(|| fail(&m::HOLD_UPGRADE, &[]))?;
         let upgrade_item = off_hand
             .get_string(NS, "id")
             .and_then(|id| item(&id))
             .filter(|d| d.upgrade.is_some())
-            .ok_or_else(|| fail("Hold an upgrade in your offhand."))?;
-        let chosen = upgrade_item.upgrade.as_deref().and_then(upgrade).ok_or_else(|| fail("That upgrade no longer exists."))?;
+            .ok_or_else(|| fail(&m::HOLD_UPGRADE, &[]))?;
+        let chosen = upgrade_item.upgrade.as_deref().and_then(upgrade).ok_or_else(|| fail(&m::UPGRADE_GONE, &[]))?;
         if chosen.bonus_for(&def).is_none() {
-            return Err(fail(&format!("{} doesn't work on {}.", upgrade_item.name, def.name)));
+            return Err(fail(&m::UPGRADE_DOESNT_FIT, &[("upgrade", &upgrade_item.name), ("item", &def.name)]));
         }
         let count = instance.upgrade_count(&chosen.id);
         if count >= chosen.max {
-            return Err(fail(&format!("{} already has the most {} it can take ({}).", def.name, chosen.name, chosen.max)));
+            return Err(fail(&m::UPGRADE_MAXED, &[("item", &def.name), ("upgrade", &chosen.name), ("max", &chosen.max)]));
         }
 
         instance.upgrades.insert(chosen.id.clone(), count + 1);
@@ -1072,7 +1026,7 @@ impl CommandHandler for Upgrade {
         let left = off_hand.get_count().saturating_sub(1);
         let rest = (left > 0).then(|| build_stack(&upgrade_item, &Instance::default(), left, &stats::current(&player)));
         player.set_item_in_hand(Hand::Left, rest);
-        sender.send_message(text(&format!("&aApplied {} &ato {} ({}/{})", upgrade_item.display_name(), def.display_name(), count + 1, chosen.max)));
+        say(&sender, &m::UPGRADED, &[("upgrade", &upgrade_item.display_name()), ("item", &def.display_name()), ("count", &(count + 1)), ("max", &chosen.max)]);
         Ok(1)
     }
 }
@@ -1083,11 +1037,11 @@ impl CommandHandler for ListReforges {
     fn handle(&self, sender: CommandSender, _: Server, _: ConsumedArgs) -> Result<i32, CommandError> {
         let held = sender.as_player().and_then(|p| relic_of(&p.get_item_in_hand(Hand::Right)?));
         let reforges = REFORGES.read().unwrap();
-        sender.send_message(text(&format!("&eReforges ({}):", reforges.len())));
+        say(&sender, &m::REFORGES_HEADER, &[("count", &reforges.len())]);
         for r in reforges.values() {
             let stats: Vec<String> = r.stats.iter().map(|(k, v)| format!("{k} {}", items::expr::format_number(*v))).collect();
-            let mark = if held.as_ref().is_some_and(|d| r.fits(d)) { "&a" } else { "&7" };
-            sender.send_message(text(&format!("{mark}- {} &7({}, weight {}): {}", r.id, r.name, r.weight, stats.join(", "))));
+            let mark = msg(if held.as_ref().is_some_and(|d| r.fits(d)) { &m::REFORGES_FITS } else { &m::REFORGES_OTHER }, &[]);
+            say(&sender, &m::REFORGES_LINE, &[("mark", &mark), ("id", &r.id), ("name", &r.name), ("weight", &r.weight), ("stats", &stats.join(", "))]);
         }
         Ok(1)
     }
@@ -1311,4 +1265,112 @@ pub fn register(context: &Context) -> Result<(), String> {
         }
     });
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::files::tests::temp_dir;
+
+    const OLD_FILES: [(&str, &str); 7] = [
+        ("kinds.kdl", "configs/kinds.kdl"),
+        ("elements.kdl", "configs/elements.kdl"),
+        ("item_rarity.kdl", "configs/item_rarity.kdl"),
+        ("reforges.kdl", "configs/reforges.kdl"),
+        ("upgrades.kdl", "configs/upgrades.kdl"),
+        ("stats_format.kdl", "formats/stats_format.kdl"),
+        ("stats_layout.kdl", "formats/stats_layout.kdl"),
+    ];
+
+    fn copy_tree(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap() {
+            let path = entry.unwrap().path();
+            let target = to.join(path.file_name().unwrap());
+            if path.is_dir() {
+                copy_tree(&path, &target);
+            } else {
+                std::fs::copy(&path, &target).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn a_fresh_folder_loads() {
+        let root = temp_dir("fresh");
+        let loaded = load_all(&root).unwrap_or_else(|p| panic!("{p:#?}"));
+        assert!(!loaded.items.is_empty());
+        assert_eq!(loaded.config, Config::default(), "config.kdl shows the defaults");
+        assert_eq!(loaded.formats.lore, texts::lore::defaults());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Loads an old-layout folder and checks every edit survived: files move byte
+    /// for byte, and the defaults do not take their place.
+    fn check_migration(root: &Path) {
+        let before: Vec<Vec<u8>> = OLD_FILES.iter().map(|(old, _)| std::fs::read(root.join(old)).unwrap()).collect();
+        load_all(root).unwrap_or_else(|p| panic!("{p:#?}"));
+        for ((old, new), bytes) in OLD_FILES.iter().zip(before) {
+            assert!(!root.join(old).exists(), "{old} should have moved");
+            assert_eq!(std::fs::read(root.join(new)).unwrap(), bytes, "{new} changed");
+        }
+    }
+
+    #[test]
+    fn an_old_folder_moves_and_keeps_its_edits() {
+        let root = temp_dir("old");
+        for (path, contents) in files::DEFAULTS.iter().filter(|(p, _)| OLD_FILES.iter().any(|(_, new)| new == p)) {
+            let name = path.rsplit('/').next().unwrap();
+            std::fs::write(root.join(name), format!("// edited\n{contents}")).unwrap();
+        }
+        check_migration(&root);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The same on a copy of a real server's files, when this checkout has one in
+    /// the old layout. The server's own folder is only read.
+    #[test]
+    fn a_real_old_folder_moves_and_keeps_its_edits() {
+        let live = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../server/plugins/data/reliquary");
+        if !live.join("kinds.kdl").exists() {
+            return;
+        }
+        let root = temp_dir("live");
+        copy_tree(&live, &root);
+        check_migration(&root);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn config_and_format_files_take_effect_and_typos_are_reported() {
+        let root = temp_dir("edited");
+        load_all(&root).unwrap_or_else(|p| panic!("{p:#?}"));
+
+        std::fs::write(root.join("configs/config.kdl"), "mana { start 7; }\ntooltip { wrap-width 12; }\nstats { player { max-mana 40; } }").unwrap();
+        std::fs::write(root.join("formats/lore_format.kdl"), "trigger-right-click \"RMB\"\nskill-costs \"costs: {costs}\"\ncost-separator \" / \"").unwrap();
+        let loaded = load_all(&root).unwrap_or_else(|p| panic!("{p:#?}"));
+        assert_eq!(loaded.config.start_mana, 7);
+        assert_eq!(loaded.config.player_stats, [("max_mana".to_string(), 40.0)]);
+        assert_eq!(loaded.formats.tooltip.wrap_width, 12);
+        let lore = loaded.items["moonlit_edge"].lore_lines(&PlayerStats::new(), &loaded.formats);
+        assert!(lore.iter().any(|l| l == "&5◆ &fMoon Slash &8· &7RMB"), "{lore:?}");
+        assert!(lore.iter().any(|l| l == "costs: 20 mana / 3s cooldown"), "{lore:?}");
+
+        // All at once, and each with its file and line.
+        std::fs::write(root.join("configs/config.kdl"), "mana {\n  strat 7\n}\n").unwrap();
+        std::fs::write(root.join("configs/messages.kdl"), "gave \"{itme}\"").unwrap();
+        std::fs::write(root.join("formats/indicators.kdl"), "nmber \"x\"").unwrap();
+        let problems = load_all(&root).err().expect("these files are broken");
+        assert!(problems.iter().any(|p| p.starts_with("configs/config.kdl:2:3: unknown setting `strat`")), "{problems:#?}");
+        assert!(problems.iter().any(|p| p.starts_with("configs/messages.kdl:1:1") && p.contains("{itme}")), "{problems:#?}");
+        assert!(problems.iter().any(|p| p.starts_with("formats/indicators.kdl:1:1")), "{problems:#?}");
+
+        // A base stat nobody knows.
+        std::fs::write(root.join("configs/config.kdl"), "stats {\n  player {\n    mxa-mana 40\n  }\n}").unwrap();
+        std::fs::remove_file(root.join("configs/messages.kdl")).unwrap();
+        std::fs::remove_file(root.join("formats/indicators.kdl")).unwrap();
+        let problems = load_all(&root).err().expect("unknown stat");
+        assert!(problems.iter().any(|p| p.contains("configs/config.kdl:3:5") && p.contains("mxa_mana")), "{problems:#?}");
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

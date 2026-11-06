@@ -31,7 +31,7 @@
 // self     Against the same element with no entry below.
 //
 // name         Shown in stat names, like "Fire Damage". Their look comes from
-//              stats_format.kdl (`stat "damage" element="fire"` to change one).
+//              formats/stats_format.kdl (`stat "damage" element="fire"` to change one).
 // color        Color codes for that name and for the icon. Optional.
 // icon         Shown on damage numbers of this element, before the number. An
 //              icon from a resource pack font works too. Optional. A weapon

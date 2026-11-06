@@ -16,16 +16,15 @@ use pumpkin_plugin_api::{
     scheduler::SchedulerExt,
 };
 
+use crate::config;
 use crate::engine::text;
 use crate::game::NS;
+use crate::texts::{indicator, indicators as look};
 
 /// Custom data key on indicator entities: when they were made (unix seconds).
 const TAG: &str = "indicator";
-/// How long a number stays, in ticks.
-const LIFETIME: u64 = 20;
-/// Indicators older than this are removed by `sweep` (e.g. after a restart).
-const MAX_AGE_SECS: u64 = 3;
-/// Only damage within this range of some player is shown.
+/// Only damage within this range of some player is shown. Also how far `find`
+/// looks, which combat depends on, so this is not a setting.
 const RANGE: f64 = 32.0;
 
 struct Pending {
@@ -124,10 +123,10 @@ fn style(skill_kind: Option<&str>, source: DamageType) -> (String, String) {
         .or_else(|| crate::game::kind_for_source(&source_name(source)));
     match kind {
         Some(k) => {
-            let color = if k.display.color.is_empty() { "&f".into() } else { k.display.color };
+            let color = if k.display.color.is_empty() { indicator(&look::KIND_COLOR, &[]) } else { k.display.color };
             (k.display.prefix, color)
         }
-        None => (String::new(), "&7".into()),
+        None => (String::new(), indicator(&look::NO_KIND_COLOR, &[])),
     }
 }
 
@@ -154,10 +153,15 @@ impl EventHandler<EntityDamageEvent> for OnDamage {
 
 fn flush(server: &Server) {
     FLUSH_SCHEDULED.store(false, Ordering::Relaxed);
+    // Always drained, also with numbers off: combat reads `PENDING` through
+    // `current_source`, so `OnDamage` keeps recording either way.
     let pending = std::mem::take(&mut *PENDING.lock().unwrap());
     let by_player = BY_PLAYER.lock().unwrap().take().unwrap_or_default();
     let hit_elements = HIT_ELEMENTS.lock().unwrap().take().unwrap_or_default();
     let crits = std::mem::take(&mut *CRITS.lock().unwrap());
+    if !config::get().indicators {
+        return;
+    }
     let elements = crate::game::elements();
     for hit in pending {
         let by = by_player.get(&hit.id);
@@ -166,8 +170,8 @@ fn flush(server: &Server) {
         }
         let (prefix, color) = style(by.and_then(|k| k.as_deref()), hit.kind);
         let icons = hit_elements.get(&hit.id).map_or_else(String::new, |ids| elements.icons(ids));
-        let number_color = if crits.contains(&hit.id) { "&6&l".to_string() } else { color.clone() };
-        let style = (format!("{icons}{color}{prefix}"), number_color);
+        let number_color = if crits.contains(&hit.id) { indicator(&look::CRIT_COLOR, &[]) } else { color.clone() };
+        let style = Style { icons, color, prefix, number_color };
         let Some((entity, _)) = find(server, hit.id) else { continue };
         let lost = match entity.as_living() {
             Some(l) if !l.is_dead() => hit.health_before - l.get_health(),
@@ -182,7 +186,15 @@ fn flush(server: &Server) {
     }
 }
 
-fn spawn(server: &Server, target: &Entity, amount: f32, (prefix, color): &(String, String)) {
+/// What one number looks like, for `number` in `indicators.kdl`.
+struct Style {
+    icons: String,
+    color: String,
+    prefix: String,
+    number_color: String,
+}
+
+fn spawn(server: &Server, target: &Entity, amount: f32, style: &Style) {
     let (x, y, z) = target.get_position();
     let seed = target.get_id() ^ (now_secs() as u32) ^ amount.to_bits();
     let pos = (x + jitter(seed), y + target.get_height() as f64 + 0.2, z + jitter(seed.rotate_left(11)));
@@ -192,22 +204,30 @@ fn spawn(server: &Server, target: &Entity, amount: f32, (prefix, color): &(Strin
         return;
     };
     let number = crate::items::expr::format_number(f64::from(amount));
-    label.set_text(text(&format!("{color}{prefix}{color}{number}")));
+    label.set_text(text(&indicator(&look::NUMBER, &[
+        ("number_color", &style.number_color),
+        ("icons", &style.icons),
+        ("color", &style.color),
+        ("prefix", &style.prefix),
+        ("number", &number),
+    ])));
     label.set_background(0);
-    label.set_shadow(true);
+    let config = config::get();
+    label.set_shadow(config.indicator_shadow);
     label.get_display().set_billboard(BillboardMode::Center);
     display.set_string(NS, TAG, &now_secs().to_string());
 
     // Float up (the client animates it), then remove.
+    let (lifetime, rise) = (config.indicator_lifetime, config.indicator_rise);
     let id = display.get_id();
     server.schedule_delayed_task(1, move |server: Server| {
         if let Some(d) = find(&server, id).and_then(|(e, _)| e.as_display()) {
             d.set_interpolation_start(0);
-            d.set_interpolation_duration(LIFETIME as i32);
-            d.set_translation(0.0, 0.8, 0.0);
+            d.set_interpolation_duration(lifetime as i32);
+            d.set_translation(0.0, rise as f32, 0.0);
         }
     });
-    server.schedule_delayed_task(LIFETIME, move |server: Server| {
+    server.schedule_delayed_task(u64::from(lifetime), move |server: Server| {
         if let Some((e, _)) = find(&server, id) {
             e.remove();
         }
@@ -218,10 +238,12 @@ fn spawn(server: &Server, target: &Entity, amount: f32, (prefix, color): &(Strin
 /// behind. Call once per second.
 pub fn sweep(server: &Server) {
     let now = now_secs();
+    // A little past a number's lifetime, so only leftovers are caught.
+    let max_age = u64::from(config::get().indicator_lifetime).div_ceil(20) + 2;
     for player in server.get_all_players() {
         for e in player.as_entity().get_nearby_entities(RANGE, RANGE, RANGE) {
             if let Some(made) = e.get_string(NS, TAG).and_then(|s| s.parse::<u64>().ok())
-                && now.saturating_sub(made) > MAX_AGE_SECS
+                && now.saturating_sub(made) > max_age
             {
                 e.remove();
             }

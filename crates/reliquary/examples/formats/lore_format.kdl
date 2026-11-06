@@ -1,0 +1,55 @@
+// The parts of item lore that stats_format.kdl does not cover. stats_layout.kdl
+// decides where each part goes. {name} parts are filled in; {fill} is the row of
+// dim dots that pushes what follows to the tooltip's right edge. Delete a line to
+// go back to its default. Apply changes with /relic reload.
+
+// ---- Rarity line ----
+rarity-kind "{color}{rarity} {kind}"
+rarity "{color}{rarity}"
+
+// ---- The item's `lore` text ----
+// Goes in front of each `lore` entry, before wrapping.
+lore-style "&7&o"
+
+// ---- Skills ----
+skill-header "{color}◆ &f{name} &8· &7{trigger}"
+// In front of each description, before wrapping.
+skill-description-style "&7"
+// In front of each wrapped description line.
+skill-description-indent "  "
+// {costs} is every cost that applies, joined by cost-separator.
+skill-costs "&8  {costs}"
+cost-separator " · "
+cost-mana "{amount} mana"
+cost-cooldown "{seconds}s cooldown"
+cost-chance "{percent}% chance"
+
+// What sets a skill off, in skill-header's {trigger}.
+trigger-right-click "Right-click"
+trigger-left-click "Left-click"
+trigger-hit "On hit"
+trigger-damaged "When hit"
+trigger-kill "On kill"
+trigger-sneak "Sneak"
+trigger-timer "Every {seconds}s"
+trigger-equip "On equip"
+trigger-unequip "On unequip"
+
+// ---- Sockets ----
+socket-empty-any "&8◇ Empty socket"
+socket-empty "&8◇ Empty {type} socket"
+socket-filled "&f◆ {gem}"
+socket-inactive "&8✖ {id} (inactive)"
+// On gems, in place of the sockets.
+gem-fits-any "&8Fits any socket"
+gem-fits "&8Fits {type} sockets"
+
+// ---- Upgrades ----
+// {full} and {empty} are upgrade-pip repeated. When they do not fit the tooltip,
+// upgrade-short is used instead.
+upgrade-pip "●"
+upgrade-bar "{color}{name} {color}{full}&8{empty}{fill}&7{count}/{max}"
+upgrade-short "{color}{name}{fill}&7{count}/{max}"
+upgrade-inactive "&8✖ {id} (inactive)"
+// On upgrade items, in place of the upgrades.
+upgrade-item-hint "&8Hold in offhand: /relic upgrade"

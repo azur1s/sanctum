@@ -1,0 +1,56 @@
+// General settings. How things behave lives here; how they look lives in
+// formats/ and what they say in messages.kdl. Anything left out keeps the value
+// shown here. Apply changes with /relic reload.
+
+mana {
+    // Mana of a player seen for the first time.
+    start 100
+    // Show the mana bar above the hotbar.
+    bar #true
+}
+
+// What everyone has before items. Listing a block replaces all of it, so a stat
+// left out of `player` starts at 0.
+stats {
+    player {
+        max-mana 100
+        mana-regen 5
+        // Extra damage of a crit in percent: 50 is 1.5x.
+        crit-power 50
+    }
+    mob {
+        crit-power 50
+    }
+}
+
+combat {
+    // A kill counts for the last player who hit within this many seconds.
+    kill-credit 5
+}
+
+commands {
+    // How far /relic equip reaches, in blocks.
+    equip-range 20
+}
+
+notices {
+    // Seconds between two identical "on cooldown" or "not enough mana" messages.
+    delay 1
+}
+
+tooltip {
+    // Tooltips are at least this wide, in pixels.
+    min-width 150
+    // Lore and skill descriptions wrap at about this many characters.
+    wrap-width 30
+}
+
+// Floating damage numbers. Their look is in formats/indicators.kdl.
+indicators {
+    enabled #true
+    // How long a number stays, in ticks (20 is one second).
+    lifetime 20
+    // How far it floats up, in blocks.
+    rise 0.8
+    shadow #true
+}

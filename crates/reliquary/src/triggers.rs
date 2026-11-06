@@ -16,8 +16,10 @@ use crate::game::{self, player_key};
 use crate::items::{ItemDef, Trigger};
 use crate::stats;
 
-/// Like vanilla: a kill counts for the last player who hit within 5 seconds.
-const KILL_CREDIT: Duration = Duration::from_secs(5);
+/// How long after a hit a kill still counts for that player.
+fn kill_credit() -> Duration {
+    Duration::from_secs_f64(crate::config::get().kill_credit)
+}
 
 /// Entity id -> (player UUID, when) of the last player hit, for `kill`.
 static LAST_HIT: Mutex<Option<HashMap<u32, (String, Instant)>>> = Mutex::new(None);
@@ -90,7 +92,7 @@ impl EventHandler<EntityDeathEvent> for OnDeath {
         let id = event.entity_id as u32;
         let credit = LAST_HIT.lock().unwrap().as_mut().and_then(|m| m.remove(&id));
         if let Some((key, when)) = credit
-            && when.elapsed() <= KILL_CREDIT
+            && when.elapsed() <= kill_credit()
             && let Some(player) = online(&server, &key)
         {
             let victim = near(&player, id);
@@ -115,8 +117,9 @@ impl EventHandler<PlayerToggleSneakEvent> for OnSneak {
 /// Call once per second, before the per-player work.
 pub fn next_second() -> u64 {
     // Forget kill credit and attackers nobody used.
+    let credit = kill_credit();
     if let Some(map) = LAST_HIT.lock().unwrap().as_mut() {
-        map.retain(|_, (_, when)| when.elapsed() <= KILL_CREDIT);
+        map.retain(|_, (_, when)| when.elapsed() <= credit);
     }
     if let Some(map) = ATTACKERS.lock().unwrap().as_mut() {
         map.clear();

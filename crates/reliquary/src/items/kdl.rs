@@ -402,6 +402,81 @@ pub fn parse_stats_layout(file: &str, src: &str) -> R<(Vec<LoreEntry>, Vec<(Stri
     Ok((layout, refs))
 }
 
+/// Parses a flat text file: `key "text"`. Only returns the lines that are there;
+/// the caller lays them on top of the defaults.
+pub fn parse_texts(file: &str, src: &str, keys: &[crate::texts::Key]) -> R<Vec<(String, String)>> {
+    let p = Parser { file, src, used_params: RefCell::default(), used_stats: RefCell::default(), used_kinds: RefCell::default(), used_elements: RefCell::default(), loop_vars: RefCell::default() };
+    let doc = p.document()?;
+    let mut lines: Vec<(String, String)> = Vec::new();
+    for node in doc.nodes() {
+        let Some(key) = keys.iter().find(|k| k.key == name(node)) else {
+            return Err(p.at(node, format!("unknown text `{}`", name(node))));
+        };
+        if lines.iter().any(|(k, _)| k == key.key) {
+            return Err(p.at(node, format!("`{}` is set twice", key.key)));
+        }
+        let text = p.str_arg(node, "its text")?;
+        if let Some(bad) = crate::texts::placeholders(&text).into_iter().find(|n| !key.placeholders.contains(n)) {
+            let allowed: Vec<String> = key.placeholders.iter().map(|n| format!("{{{n}}}")).collect();
+            let allowed = if allowed.is_empty() { "none".to_string() } else { allowed.join(", ") };
+            return Err(p.at(node, format!("unknown placeholder `{{{bad}}}` in `{}` (it takes: {allowed})", key.key)));
+        }
+        lines.push((key.key.to_string(), text));
+    }
+    Ok(lines)
+}
+
+/// Parses `config.kdl`. Anything left out keeps its default. Also returns each
+/// base stat with its "file:line:col", to check once every stat is known.
+pub fn parse_config(file: &str, src: &str) -> R<(crate::config::Config, Vec<(String, String)>)> {
+    let p = Parser { file, src, used_params: RefCell::default(), used_stats: RefCell::default(), used_kinds: RefCell::default(), used_elements: RefCell::default(), loop_vars: RefCell::default() };
+    let doc = p.document()?;
+    let mut c = crate::config::Config::default();
+    let mut refs = Vec::new();
+    let mut seen: Vec<&str> = Vec::new();
+    for section in doc.nodes() {
+        let section_name = name(section);
+        if !["mana", "stats", "combat", "commands", "notices", "tooltip", "indicators"].contains(&section_name) {
+            return Err(p.at(section, format!("unknown section `{section_name}` (expected mana, stats, combat, commands, notices, tooltip or indicators)")));
+        }
+        if seen.contains(&section_name) {
+            return Err(p.at(section, format!("`{section_name}` is set twice")));
+        }
+        seen.push(section_name);
+        p.shape(section, 0, &[], true)?;
+        for node in children(section) {
+            let field = name(node);
+            match (section_name, field) {
+                ("mana", "start") => c.start_mana = p.whole_field(node)?,
+                ("mana", "bar") => c.mana_bar = p.bool_field(node)?,
+                ("stats", "player") => c.player_stats = p.base_stats(node, &mut refs)?,
+                ("stats", "mob") => c.mob_stats = p.base_stats(node, &mut refs)?,
+                ("combat", "kill-credit") => c.kill_credit = p.amount_field(node)?,
+                ("commands", "equip-range") => c.equip_range = p.amount_field(node)?,
+                ("notices", "delay") => c.notice_delay = p.amount_field(node)?,
+                ("tooltip", "min-width") => c.tooltip.min_width = p.whole_field(node)?,
+                ("tooltip", "wrap-width") => {
+                    c.tooltip.wrap_width = p.whole_field(node)? as usize;
+                    if c.tooltip.wrap_width == 0 {
+                        return Err(p.at(node, "`wrap-width` must be at least 1"));
+                    }
+                }
+                ("indicators", "enabled") => c.indicators = p.bool_field(node)?,
+                ("indicators", "lifetime") => {
+                    c.indicator_lifetime = p.whole_field(node)?;
+                    if c.indicator_lifetime == 0 {
+                        return Err(p.at(node, "`lifetime` must be at least 1 tick"));
+                    }
+                }
+                ("indicators", "rise") => c.indicator_rise = p.number_field(node)?,
+                ("indicators", "shadow") => c.indicator_shadow = p.bool_field(node)?,
+                _ => return Err(p.at(node, format!("unknown setting `{field}` in `{section_name}`"))),
+            }
+        }
+    }
+    Ok((c, refs))
+}
+
 /// Parses one file. A file may contain any number of `item` and `skill` nodes.
 pub fn parse_file(file: &str, src: &str) -> R<Parsed> {
     let p = Parser { file, src, used_params: RefCell::default(), used_stats: RefCell::default(), used_kinds: RefCell::default(), used_elements: RefCell::default(), loop_vars: RefCell::default() };
@@ -654,6 +729,42 @@ impl Parser<'_> {
         Ok(s)
     }
 
+    fn number_field(&self, node: &KdlNode) -> R<f64> {
+        self.shape(node, 1, &[], false)?;
+        self.number(self.arg(node, 0, "a number")?)
+    }
+
+    /// A number of 0 or more: seconds, blocks.
+    fn amount_field(&self, node: &KdlNode) -> R<f64> {
+        let value = self.number_field(node)?;
+        if !value.is_finite() || value < 0.0 {
+            return Err(self.at(node, format!("`{}` can't be negative", name(node))));
+        }
+        Ok(value)
+    }
+
+    fn whole_field(&self, node: &KdlNode) -> R<u32> {
+        self.shape(node, 1, &[], false)?;
+        self.whole(self.arg(node, 0, "a whole number")?)
+    }
+
+    fn bool_field(&self, node: &KdlNode) -> R<bool> {
+        self.shape(node, 1, &[], false)?;
+        self.boolean(self.arg(node, 0, "#true or #false")?)
+    }
+
+    /// `player { max-mana 100; crit-power 50 }`, kebab-case or snake_case.
+    fn base_stats(&self, node: &KdlNode, refs: &mut Vec<(String, String)>) -> R<Vec<(String, f64)>> {
+        self.shape(node, 0, &[], true)?;
+        let mut stats = Vec::new();
+        for child in children(node) {
+            let stat = name(child).replace('-', "_");
+            refs.push((stat.clone(), self.position(child)));
+            stats.push((stat, self.number_field(child)?));
+        }
+        Ok(stats)
+    }
+
     fn str_arg(&self, node: &KdlNode, what: &str) -> R<String> {
         self.shape(node, 1, &[], false)?;
         self.string(self.arg(node, 0, what)?)
@@ -741,7 +852,7 @@ impl Parser<'_> {
             match name(child) {
                 "sockets" => sockets = self.sockets(child)?,
                 "gem" => gem = Some(self.socket_type(self.arg(child, 0, "a socket type, like `gem \"red\"`")?)?),
-                "upgrade" => upgrade = Some(self.str_arg(child, "an upgrade from upgrades.kdl")?),
+                "upgrade" => upgrade = Some(self.str_arg(child, "an upgrade from configs/upgrades.kdl")?),
                 "reforgeable" => {
                     self.shape(child, 1, &[], false)?;
                     reforgeable = self.boolean(self.arg(child, 0, "#true or #false")?)?;
@@ -762,7 +873,7 @@ impl Parser<'_> {
                 "base" => base = Some(self.str_arg(child, "a vanilla item, like \"minecraft:diamond_sword\"")?),
                 "model" => model = Some(self.str_arg(child, "an item model id")?),
                 "kind" => kind = Some(self.str_arg(child, "a kind, like \"Sword\"")?),
-                "rarity" => rarity = Some((self.str_arg(child, "a rarity from item_rarity.kdl")?, self.position(child))),
+                "rarity" => rarity = Some((self.str_arg(child, "a rarity from configs/item_rarity.kdl")?, self.position(child))),
                 "slot" => {
                     let value = self.str_arg(child, "a slot")?;
                     slot = Some(Slot::parse(&value).ok_or_else(|| {
@@ -1443,7 +1554,7 @@ mod tests {
     }
 
     fn rarities() -> Vec<Arc<RarityDef>> {
-        let src = include_str!("../../examples/item_rarity.kdl");
+        let src = include_str!("../../examples/configs/item_rarity.kdl");
         parse_rarities("item_rarity.kdl", src).unwrap().into_iter().map(Arc::new).collect()
     }
 
@@ -1497,14 +1608,14 @@ mod tests {
         assert_eq!(armor.items[1].item.stats["magic_power"], 20.0);
         // magic-power and magic-defense are declared by kinds.kdl (the loader
         // adds each kind's power and defense stats).
-        let kinds = parse_kinds("kinds.kdl", include_str!("../../examples/kinds.kdl")).unwrap();
+        let kinds = parse_kinds("kinds.kdl", include_str!("../../examples/configs/kinds.kdl")).unwrap();
         let declared = kinds.iter().flat_map(|k| k.power.iter().chain(&k.defense).cloned()).collect();
         assert!(armor.items.iter().all(|f| check_stats(f, &declared).is_empty()));
     }
 
     #[test]
     fn damage_kinds() {
-        let kinds = parse_kinds("kinds.kdl", include_str!("../../examples/kinds.kdl")).unwrap();
+        let kinds = parse_kinds("kinds.kdl", include_str!("../../examples/configs/kinds.kdl")).unwrap();
         assert_eq!(
             kinds[1],
             DamageKind {
@@ -1600,7 +1711,7 @@ mod tests {
 
     #[test]
     fn lore_layout() {
-        let formats = parse_stat_formats("f", include_str!("../../examples/stats_format.kdl")).unwrap().0;
+        let formats = parse_stat_formats("f", include_str!("../../examples/formats/stats_format.kdl")).unwrap().0;
         let lore = item(include_str!("../../examples/items/moonlit_edge.kdl")).lore_lines(&PlayerStats::new(), &formats);
         assert_eq!(lore[0], "&5Epic Sword");
         // Vanilla-backed stats show too, in the file's order.
@@ -1841,7 +1952,7 @@ mod tests {
 
     #[test]
     fn elements_file() {
-        let e = parse_elements("e", include_str!("../../examples/elements.kdl")).unwrap();
+        let e = parse_elements("e", include_str!("../../examples/configs/elements.kdl")).unwrap();
         assert_eq!(e.multiplier("fire", "water"), 1.25, "own entry");
         assert_eq!(e.multiplier("fire", "fire"), 0.7, "self default");
         assert_eq!(e.default, 1.0);
@@ -1873,7 +1984,7 @@ mod tests {
         assert!(e.contains("only works on main-hand items"), "{e}");
 
         // Unknown elements and stats that mean nothing per element.
-        let elements = parse_elements("e", include_str!("../../examples/elements.kdl")).unwrap();
+        let elements = parse_elements("e", include_str!("../../examples/configs/elements.kdl")).unwrap();
         let taggable = ["damage".to_string(), "defense".to_string()].into();
         let at = |key: &str| vec![(key.to_string(), "here".to_string())];
         assert!(check_stat_elements(&at("damage.fire"), &taggable, &elements).is_empty());

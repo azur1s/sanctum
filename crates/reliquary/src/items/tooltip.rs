@@ -3,8 +3,6 @@
 
 use super::font_widths::{ASCII, OTHER};
 
-/// Tooltips are at least this wide, in pixels, so short items still look right.
-const MIN_WIDTH: u32 = 150;
 /// The fewest pixels between a stat's name and its value.
 const MIN_FILL: u32 = 12;
 /// The shortest stretch of line on each side of a divider's title.
@@ -125,13 +123,13 @@ pub(super) fn min_line_width(line: &str) -> u32 {
 }
 
 /// The pixels `line` leaves free in a tooltip of the smallest width.
-pub(super) fn room_left(line: &str) -> u32 {
-    MIN_WIDTH.saturating_sub(min_line_width(line))
+pub(super) fn room_left(line: &str, min_width: u32) -> u32 {
+    min_width.saturating_sub(min_line_width(line))
 }
 
 /// How wide a tooltip has to be for these line widths.
-pub(super) fn tooltip_width(widths: impl IntoIterator<Item = u32>) -> u32 {
-    widths.into_iter().fold(MIN_WIDTH, u32::max)
+pub(super) fn tooltip_width(widths: impl IntoIterator<Item = u32>, min_width: u32) -> u32 {
+    widths.into_iter().fold(min_width, u32::max)
 }
 
 /// Puts dots in place of `{fill}` so the line is `width` pixels wide.

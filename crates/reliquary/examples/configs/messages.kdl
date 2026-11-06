@@ -1,0 +1,101 @@
+// Everything the plugin says to players. Colors work as everywhere else: &a,
+// &l, &#ff8800. {name} parts are filled in; each message only takes the ones it
+// shows here, and a misspelled one is an error on load. Delete a line to go back
+// to its default. Apply changes with /relic reload.
+
+// ---- Above the hotbar ----
+mana-bar "&b✦ Mana {mana}/{max}"
+mana-bar-infinite "&b✦ Mana ∞"
+
+// ---- Using skills ----
+on-cooldown "&cThis ability is on cooldown for {seconds}s"
+not-enough-mana "&cNot enough mana"
+
+// ---- /relic menu ----
+menu-title "Reliquary items ({page}/{pages})"
+menu-click-hint "&eClick to get one"
+menu-previous "&ePrevious page"
+menu-next "&eNext page"
+menu-count "&f{count} items"
+menu-got "&aGot {item}"
+
+// ---- Any command ----
+only-players "&cOnly players can use this."
+no-player-found "&cNo player found."
+name-a-player "&cName a player when using this from the console."
+missing-item-id "&cMissing item id."
+unknown-item "&cUnknown item '{id}'. Try /relic list."
+inventory-full "&cInventory full."
+
+// ---- /relic give, equip, list ----
+gave "&aGave {item}"
+no-relic "&cNo relic `{id}`."
+look-at-mob "&cLook at a mob first."
+equipped-mob "&aPut {item} on the mob ({slot})"
+list-header "&eItems ({count}):"
+list-line "&7- &f{id} &7({item})"
+
+// ---- /relic stats ----
+stats-header "&e{player}'s stats &7(mana {mana}/{max})"
+stats-line "&7- {stat}: &f{value}"
+stats-from "&eFrom:"
+stats-base "&7- base: {stats}"
+stats-source "&7- {slot}: {item} &7{stats}"
+stats-none "no stats"
+
+// ---- /relic eval, mana ----
+missing-formula "&cMissing formula."
+formula-error "&cat {at}: {error}"
+formula-result "&7{formula} &f= &b{value}"
+whole-number "&cExpected a whole number."
+
+// ---- /relic admin ----
+state-on "&aON"
+state-off "&cOFF"
+admin-no-cooldowns "&eNo cooldowns: {state}"
+admin-infinite-mana "&eInfinite mana: {state}"
+
+// ---- /relic reload ----
+reloaded "&aReloaded {count} item(s)."
+reload-failed "&cReload failed, kept the old items ({count} problem(s)):"
+reload-problem "&7- {problem}"
+
+// ---- Changing an item ----
+hold-item "&cHold an item in your main hand."
+not-reliquary-item "&cThat isn't a Reliquary item."
+hold-relic "&cHold the item you want to change, not a gem or upgrade."
+hold-one "&cHold just one of it."
+
+// ---- /relic reforge, reforges ----
+cant-reforge "&c{item} can't be reforged."
+reforge-doesnt-fit "&c'{id}' doesn't fit {item}. Fits: {fits}"
+no-reforge-fits "&cNo reforge fits {item}."
+reforged "&aReforged into {color}{reforge} {item}"
+reforges-header "&eReforges ({count}):"
+// {mark} is reforges-fits on what fits the held item, else reforges-other.
+reforges-line "{mark}- {id} &7({name}, weight {weight}): {stats}"
+reforges-fits "&a"
+reforges-other "&7"
+
+// ---- /relic socket, unsocket ----
+no-sockets "&c{item} has no sockets."
+hold-gem "&cHold a gem in your offhand."
+socket-taken "&cSocket {socket} is taken. Use /relic unsocket {socket} first."
+sockets-full "&cEvery socket on {item} is taken."
+socketed "&aSocketed {gem} &ainto socket {socket}"
+no-gems "&cNo gems to take out."
+socket-empty "&cSocket {socket} is empty."
+gem-gone "&cGem '{id}' no longer exists, so it can't come out. Restore its definition."
+unsocketed "&aTook {gem} &aout of socket {socket}"
+not-a-gem "&c{gem} is not a gem."
+no-such-socket "&c{item} has no socket {socket}."
+wrong-socket "&c{gem} is a {type} gem; socket {socket} takes {takes}."
+gem-stat-main-hand "&c{gem}'s {stat} only works on main-hand items that have that stat."
+gem-skill-main-hand "&c{gem}'s {skill} only works on main-hand items."
+
+// ---- /relic upgrade ----
+hold-upgrade "&cHold an upgrade in your offhand."
+upgrade-gone "&cThat upgrade no longer exists."
+upgrade-doesnt-fit "&c{upgrade} doesn't work on {item}."
+upgrade-maxed "&c{item} already has the most {upgrade} it can take ({max})."
+upgraded "&aApplied {upgrade} &ato {item} ({count}/{max})"

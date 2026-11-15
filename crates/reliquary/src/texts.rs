@@ -184,6 +184,9 @@ sheet! {
         UPGRADE_DOESNT_FIT = "upgrade-doesnt-fit" ["upgrade", "item"],
         UPGRADE_MAXED = "upgrade-maxed" ["item", "upgrade", "max"],
         UPGRADED = "upgraded" ["upgrade", "item", "count", "max"],
+        UPGRADE_ALREADY = "upgrade-already" ["item", "upgrade"],
+        UPGRADE_STARTED = "upgrade-started" ["upgrade", "item", "next"],
+        UPGRADE_GREW = "upgrade-grew" ["color", "upgrade", "item", "level", "max"],
     }
 }
 
@@ -203,6 +206,8 @@ sheet! {
         COST_CHANCE = "cost-chance" ["percent"],
         TRIGGER_RIGHT_CLICK = "trigger-right-click",
         TRIGGER_LEFT_CLICK = "trigger-left-click",
+        TRIGGER_SNEAK_RIGHT_CLICK = "trigger-sneak-right-click",
+        TRIGGER_SNEAK_LEFT_CLICK = "trigger-sneak-left-click",
         TRIGGER_HIT = "trigger-hit",
         TRIGGER_DAMAGED = "trigger-damaged",
         TRIGGER_KILL = "trigger-kill",
@@ -219,6 +224,8 @@ sheet! {
         UPGRADE_PIP = "upgrade-pip",
         UPGRADE_BAR = "upgrade-bar" ["color", "name", "full", "empty", "fill", "count", "max"],
         UPGRADE_SHORT = "upgrade-short" ["color", "name", "fill", "count", "max"],
+        UPGRADE_GROWING = "upgrade-growing" ["color", "name", "fill", "level", "max", "progress", "next"],
+        UPGRADE_GROWN = "upgrade-grown" ["color", "name", "fill", "level", "max", "progress"],
         UPGRADE_INACTIVE = "upgrade-inactive" ["id"],
         UPGRADE_ITEM_HINT = "upgrade-item-hint",
     }

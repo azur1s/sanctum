@@ -3,6 +3,7 @@ use tracing::*;
 
 mod admin;
 mod config;
+mod counters;
 mod engine;
 mod files;
 mod game;

@@ -13,9 +13,9 @@ use pumpkin_plugin_api::{
     wit::pumpkin::plugin::{sounds::SoundCategory, status_effect::StatusEffectInstance},
 };
 
-use crate::items::{Action, Actions, Check, Condition, ItemDef, Mechanic, Num, Params, PlayerStats, Scope, Targeter, Trigger, stat_key};
+use crate::items::{Action, Actions, Check, Condition, ItemDef, Mechanic, Num, Params, PlayerStats, Scope, SkillDef, Targeter, Trigger, stat_key};
 use crate::texts::{messages, msg};
-use crate::{admin, mana, names};
+use crate::{admin, counters, mana, names};
 
 type Vec3 = (f64, f64, f64);
 
@@ -32,6 +32,15 @@ pub struct Cast<'a> {
     pub stats: Arc<PlayerStats>,
     /// Started by `triggers-hit`: its own damage does not trigger hits again.
     pub from_proc: bool,
+    /// Whose counters `$name` and `counter-add` use, for skills that have any.
+    pub counters: RefCell<Option<Arc<CounterScope>>>,
+}
+
+/// The item skill a cast's counters belong to.
+pub struct CounterScope {
+    /// The item skill's cooldown group: counters are per item, like cooldowns.
+    pub group: String,
+    pub skill: Arc<SkillDef>,
 }
 
 impl Cast<'_> {
@@ -48,7 +57,20 @@ impl Cast<'_> {
         let outer = self.params.replace(Arc::new(params));
         let result = f();
         self.params.replace(outer);
+        // `f` may have changed counters.
+        self.refresh_counters();
         result
+    }
+
+    /// Puts the current counter values in the params, as `$name`.
+    fn refresh_counters(&self) {
+        let Some(scope) = self.counters.borrow().clone() else { return };
+        let (player, now) = (self.caster.get_id().to_string(), Instant::now());
+        let mut params = Params::clone(&self.params.borrow());
+        for def in &scope.skill.counters {
+            params.insert(def.name.clone(), f64::from(counters::get(&player, &scope.group, def, now)));
+        }
+        self.params.replace(Arc::new(params));
     }
 }
 
@@ -123,6 +145,35 @@ fn notice(player: &Player, kind: &'static str, msg: &str) {
     player.send_system_message(text(msg), false);
 }
 
+/// While a melee hit is being handled: the entity being hit, and the skill
+/// damage aimed at it so far. Vanilla gives an entity ~10 ticks of
+/// invulnerability after a hit, during which only damage above the last hit
+/// counts (and only the difference), so a separate skill hit in the same tick
+/// would give `max(weapon, skill)` instead of the sum. That damage is added to
+/// the melee hit instead.
+static HIT_FOLD: Mutex<Option<(u32, f64)>> = Mutex::new(None);
+
+/// Starts adding skill damage on `victim` to the current melee hit.
+pub fn begin_hit_fold(victim: u32) {
+    *HIT_FOLD.lock().unwrap() = Some((victim, 0.0));
+}
+
+/// Stops, and returns the damage to add to the melee hit.
+pub fn end_hit_fold() -> f64 {
+    HIT_FOLD.lock().unwrap().take().map_or(0.0, |(_, extra)| extra)
+}
+
+/// Adds `amount` to the current melee hit if it is on `victim`.
+fn fold_into_hit(victim: u32, amount: f64) -> bool {
+    match HIT_FOLD.lock().unwrap().as_mut() {
+        Some((id, extra)) if *id == victim => {
+            *extra += amount;
+            true
+        }
+        _ => false,
+    }
+}
+
 /// A random number in 0.0..1.0, from the server's UUID generator.
 /// Uses the low 53 bits: the top bits of a v4 UUID are fixed variant bits.
 pub(crate) fn random() -> f64 {
@@ -139,6 +190,9 @@ pub fn try_cast(cast: &Cast, item: &ItemDef, skill_index: usize) -> bool {
     if use_.chance < 1.0 && random() >= use_.chance {
         return false;
     }
+    let scope = (!skill.counters.is_empty()).then(|| Arc::new(CounterScope { group: cooldown_group(item, skill_index), skill: skill.clone() }));
+    cast.counters.replace(scope);
+    cast.refresh_counters();
     if let Subject::Entity(caster) = &me
         && !skill.conditions.iter().all(|c| check(c, caster))
     {
@@ -356,6 +410,7 @@ fn later(cast: &Cast, subject: &Subject, ticks: u32, f: impl Fn(&Cast, &Subject)
     let caster_id = cast.caster.get_id().to_string();
     let victim_id = cast.victim.as_ref().map(Entity::get_id);
     let (params, stats, from_proc) = (cast.params.borrow().clone(), cast.stats.clone(), cast.from_proc);
+    let counters = cast.counters.borrow().clone();
     let saved = match subject {
         Subject::Entity(e) => Saved::Entity(e.get_id()),
         Subject::Point(p) => Saved::Point(*p),
@@ -372,7 +427,18 @@ fn later(cast: &Cast, subject: &Subject, ticks: u32, f: impl Fn(&Cast, &Subject)
             },
             Saved::Point(p) => Subject::Point(p),
         };
-        f(&Cast { server: &server, caster, victim, params: RefCell::new(params.clone()), stats: stats.clone(), from_proc }, &subject);
+        let cast = Cast {
+            server: &server,
+            caster,
+            victim,
+            params: RefCell::new(params.clone()),
+            stats: stats.clone(),
+            from_proc,
+            counters: RefCell::new(counters.clone()),
+        };
+        // Other casts may have changed the counters while this one waited.
+        cast.refresh_counters();
+        f(&cast, &subject);
     });
 }
 
@@ -585,6 +651,19 @@ fn apply(cast: &Cast, mechanic: &Mechanic, subject: &Subject) {
             }
             return;
         }
+        Mechanic::CounterAdd { counter, amount } => {
+            let amount = n(amount);
+            let scope = cast.counters.borrow().clone();
+            if let Some(scope) = scope
+                && let Some(def) = scope.skill.counters.iter().find(|c| &c.name == counter)
+            {
+                let value = counters::add(&cast.caster.get_id().to_string(), &scope.group, def, amount, Instant::now());
+                let mut params = Params::clone(&cast.params.borrow());
+                params.insert(counter.clone(), f64::from(value));
+                cast.params.replace(Arc::new(params));
+            }
+            return;
+        }
         Mechanic::Sound { sound, volume, pitch } => {
             world.play_custom_sound(sound, SoundCategory::Players, subject.pos(), n(volume) as f32, n(pitch) as f32);
             return;
@@ -627,10 +706,20 @@ fn apply(cast: &Cast, mechanic: &Mechanic, subject: &Subject) {
             let crit = if e.get_id() == cast.caster.as_entity().get_id() { None } else { crate::stats::crit_multiplier(&cast.stats, random()) };
             total *= crit.unwrap_or(1.0);
             if let (Some(living), Some(source)) = (e.as_living(), names::damage_type(source)) {
-                living.damage(total as f32, source);
+                // On the entity being hit right now: part of that hit (see HIT_FOLD).
+                if fold_into_hit(e.get_id(), total) {
+                    crate::triggers::note_hit(e.get_id(), &cast.caster);
+                    if *triggers_hit && !cast.from_proc && e.get_id() != cast.caster.as_entity().get_id() {
+                        crate::game::proc_hit(cast.server, &cast.caster, e);
+                    }
+                    return;
+                }
                 // Skill damage has no attacker in the API, so remember it for
-                // `kill` and for damage numbers.
+                // `kill` and for damage numbers. Before the damage: a killing
+                // blow runs the death event inside `damage`, and a note made
+                // after it would be too late for the kill to count.
                 crate::triggers::note_hit(e.get_id(), &cast.caster);
+                living.damage(total as f32, source);
                 crate::indicators::note_player_damage(e.get_id(), kind.as_ref().map(|k| k.id.as_str()));
                 crate::indicators::note_elements(e.get_id(), element.iter().cloned().collect());
                 if crit.is_some() {
@@ -699,7 +788,7 @@ fn apply(cast: &Cast, mechanic: &Mechanic, subject: &Subject) {
                 None => e.teleport(feet, world),
             }
         }
-        Mechanic::Particle { .. } | Mechanic::Sound { .. } | Mechanic::Lightning { .. } | Mechanic::Message { .. } => {}
+        Mechanic::Particle { .. } | Mechanic::Sound { .. } | Mechanic::Lightning { .. } | Mechanic::Message { .. } | Mechanic::CounterAdd { .. } => {}
     }
 }
 

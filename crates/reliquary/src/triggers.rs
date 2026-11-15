@@ -13,7 +13,7 @@ use pumpkin_plugin_api::{
 };
 
 use crate::game::{self, player_key};
-use crate::items::{ItemDef, Trigger};
+use crate::items::{Gain, ItemDef, Trigger};
 use crate::stats;
 
 /// How long after a hit a kill still counts for that player.
@@ -97,6 +97,14 @@ impl EventHandler<EntityDeathEvent> for OnDeath {
         {
             let victim = near(&player, id);
             fire_equipped(&server, player, victim, Trigger::Kill);
+            // One tick later, like `damaged`: rewriting the held item inside the
+            // server's damage code is asking for trouble. The kill goes to
+            // whatever is equipped by then.
+            server.schedule_delayed_task(1, move |server: Server| {
+                if let Some(player) = online(&server, &key) {
+                    game::grow_upgrades(&player, Gain::Kill);
+                }
+            });
         }
         event
     }

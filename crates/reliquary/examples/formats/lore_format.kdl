@@ -27,6 +27,8 @@ cost-chance "{percent}% chance"
 // What sets a skill off, in skill-header's {trigger}.
 trigger-right-click "Right-click"
 trigger-left-click "Left-click"
+trigger-sneak-right-click "Sneak Right-click"
+trigger-sneak-left-click "Sneak Left-click"
 trigger-hit "On hit"
 trigger-damaged "When hit"
 trigger-kill "On kill"
@@ -50,6 +52,11 @@ gem-fits "&8Fits {type} sockets"
 upgrade-pip "●"
 upgrade-bar "{color}{name} {color}{full}&8{empty}{fill}&7{count}/{max}"
 upgrade-short "{color}{name}{fill}&7{count}/{max}"
+// Upgrades that level up on their own (`gain` in upgrades.kdl). {progress} is
+// what it has counted, {next} the total its next level is at.
+upgrade-growing "{color}{name} {level}{fill}&7{progress}/{next}"
+// At its highest level.
+upgrade-grown "{color}{name} {level}{fill}&7Max"
 upgrade-inactive "&8✖ {id} (inactive)"
 // On upgrade items, in place of the upgrades.
 upgrade-item-hint "&8Hold in offhand: /relic upgrade"

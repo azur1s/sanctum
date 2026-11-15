@@ -3,7 +3,7 @@ members = ["crates/*"]
 resolver = "3"
 
 [workspace.dependencies]
-pumpkin-plugin-api = { git = "https://github.com/Pumpkin-MC/Pumpkin", rev = "a83abeea" }
+pumpkin-plugin-api = { path = "../pumpkin/crates/pumpkin-plugin-api" }
 serde = { version = "1.0.229", features = ["derive"] }
 toml = "1.1.8"
 tracing = "0.1"

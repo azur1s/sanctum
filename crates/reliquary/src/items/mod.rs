@@ -18,7 +18,7 @@ mod kdl;
 mod tooltip;
 
 pub use expr::{Expr, Params, PlayerStats, Scope};
-pub use forge::{link_upgrades, Instance, ReforgeDef, Reforges, SocketView, UpgradeDef, UpgradeView, Upgrades};
+pub use forge::{link_upgrades, Gain, Instance, ReforgeDef, Reforges, SocketView, UpgradeDef, UpgradeView, Upgrades};
 pub use kdl::{parse_config, parse_elements, parse_file, parse_kinds, parse_rarities, parse_reforges, parse_stat_formats, parse_stats_layout, parse_texts, parse_upgrades};
 pub use tooltip::{expand_hex, Divider, Rgb};
 
@@ -55,6 +55,8 @@ pub struct ItemDef {
     /// `fake-enchant #true` gives the item the enchantment glint, with no
     /// enchantment behind it.
     pub fake_enchant: bool,
+    /// `color "#3c44aa"`: the dye color of leather armor (and other dyeable bases).
+    pub color: Option<Rgb>,
     /// Set on upgrade items: the upgrade in `upgrades.kdl` it applies.
     pub upgrade: Option<String>,
     /// Filled in by `with_instance`, for the lore.
@@ -268,6 +270,8 @@ impl StatFormats {
         let key = match trigger {
             Trigger::RightClick => &lore::TRIGGER_RIGHT_CLICK,
             Trigger::LeftClick => &lore::TRIGGER_LEFT_CLICK,
+            Trigger::SneakRightClick => &lore::TRIGGER_SNEAK_RIGHT_CLICK,
+            Trigger::SneakLeftClick => &lore::TRIGGER_SNEAK_LEFT_CLICK,
             Trigger::Hit => &lore::TRIGGER_HIT,
             Trigger::Damaged => &lore::TRIGGER_DAMAGED,
             Trigger::Kill => &lore::TRIGGER_KILL,
@@ -370,8 +374,14 @@ impl Num {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Trigger {
+    /// Right-click while not sneaking.
     RightClick,
+    /// Left-click while not sneaking.
     LeftClick,
+    /// Right-click while sneaking.
+    SneakRightClick,
+    /// Left-click while sneaking.
+    SneakLeftClick,
     /// Melee hit on an entity. The hit entity is the `victim` target.
     Hit,
     /// The holder takes damage. The attacker (if any) is the `attacker` target.
@@ -393,6 +403,8 @@ impl Trigger {
         match self {
             Trigger::RightClick => "Right-click".into(),
             Trigger::LeftClick => "Left-click".into(),
+            Trigger::SneakRightClick => "Sneak + Right-click".into(),
+            Trigger::SneakLeftClick => "Sneak + Left-click".into(),
             Trigger::Hit => "On hit".into(),
             Trigger::Damaged => "When hit".into(),
             Trigger::Kill => "On kill".into(),
@@ -403,9 +415,20 @@ impl Trigger {
         }
     }
 
-    /// Clicks and melee hits only come from the main-hand item.
+    /// Which `sneaking` condition can never pass with this trigger: clicks
+    /// already decide whether the holder is sneaking.
+    fn decided_sneaking(self) -> Option<bool> {
+        match self {
+            Trigger::RightClick | Trigger::LeftClick => Some(false),
+            Trigger::SneakRightClick | Trigger::SneakLeftClick => Some(true),
+            _ => None,
+        }
+    }
+
+    /// Clicks only come from the main-hand item. (Melee hits run the `hit`
+    /// skills of everything equipped.)
     pub fn main_hand_only(self) -> bool {
-        matches!(self, Trigger::RightClick | Trigger::LeftClick | Trigger::Hit)
+        matches!(self, Trigger::RightClick | Trigger::LeftClick | Trigger::SneakRightClick | Trigger::SneakLeftClick)
     }
 }
 
@@ -427,6 +450,27 @@ pub struct SkillDef {
     /// Runs instead of the skill when a `required` target block finds nothing.
     /// No mana is spent and no cooldown starts.
     pub on_fail: Actions,
+    /// `counter "rage" ...`, read in formulas as `$rage`.
+    pub counters: Vec<CounterDef>,
+}
+
+/// `counter "rage" max=8 expire="5s" decay="all"`: a number kept between
+/// casts, per player and per item skill.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CounterDef {
+    pub name: String,
+    pub max: Option<u32>,
+    /// Seconds without a `counter-add` before it decays.
+    pub expire: Option<f64>,
+    pub decay: Decay,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Decay {
+    /// Back to 0 at once.
+    All,
+    /// One less per `expire` seconds.
+    One,
 }
 
 /// Shared so delayed parts of a skill can keep running after the event ends.
@@ -544,6 +588,8 @@ pub enum Mechanic {
     /// Teleports the subject up to `distance` blocks where the caster looks,
     /// stopping before walls.
     Blink { distance: Num },
+    /// Adds to one of the skill's counters (negative takes away).
+    CounterAdd { counter: String, amount: Num },
 }
 
 impl Mechanic {
@@ -551,7 +597,7 @@ impl Mechanic {
     pub fn works_on_points(&self) -> bool {
         matches!(
             self,
-            Mechanic::Particle { .. } | Mechanic::Sound { .. } | Mechanic::Lightning { .. } | Mechanic::Message { .. }
+            Mechanic::Particle { .. } | Mechanic::Sound { .. } | Mechanic::Lightning { .. } | Mechanic::Message { .. } | Mechanic::CounterAdd { .. }
         )
     }
 
@@ -570,6 +616,7 @@ impl Mechanic {
             Mechanic::Dash { .. } => "dash",
             Mechanic::Pull { .. } => "pull",
             Mechanic::Blink { .. } => "blink",
+            Mechanic::CounterAdd { .. } => "counter-add",
         }
     }
 }
@@ -745,6 +792,8 @@ pub struct SkillUse {
     pub mana_cost: Option<u32>,
     pub cooldown: Option<f32>,
     pub chance: Option<f64>,
+    /// `trigger="..."`: sets the skill off with this instead of its own trigger.
+    pub trigger: Option<Trigger>,
     pub params: Params,
 }
 
@@ -821,6 +870,23 @@ pub fn link(
                 }
             },
         };
+        let skill = match u.trigger {
+            Some(trigger) if trigger != skill.trigger => Arc::new(SkillDef { trigger, ..(*skill).clone() }),
+            _ => skill,
+        };
+        if let Some(sneaking) = skill.trigger.decided_sneaking()
+            && skill.conditions.iter().any(|c| matches!(c.check, Check::Sneaking) && c.negate == sneaking)
+        {
+            let fix = if sneaking { "sneak_" } else { "" };
+            problems.push(format!(
+                "{}: skill `{}` triggers on {} but has `when \"{}sneaking\"`, so it can never fire (use trigger \"{fix}right_click\" / \"{fix}left_click\" and drop the `when`)",
+                u.at,
+                skill.id,
+                skill.trigger.label().to_lowercase(),
+                if sneaking { "!" } else { "" },
+            ));
+            continue;
+        }
         if item.slot != Slot::MainHand && skill.trigger.main_hand_only() {
             problems.push(format!(
                 "{}: skill `{}` triggers on {}, which only works for main-hand items (this item goes in {:?})",

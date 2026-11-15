@@ -29,24 +29,34 @@ pub struct Instance {
     pub gems: Vec<Option<String>>,
     /// Upgrade id -> how many were applied.
     pub upgrades: BTreeMap<String, u32>,
+    /// Upgrade id -> what a growing upgrade has counted so far, like kills.
+    pub progress: BTreeMap<String, u32>,
+}
+
+/// "polish:7,shine:2" -> id and number pairs. Entries that are malformed or
+/// zero are dropped.
+fn decode_counts(text: Option<String>) -> BTreeMap<String, u32> {
+    text.iter()
+        .flat_map(|s| s.split(','))
+        .filter_map(|entry| {
+            let (id, count) = entry.split_once(':')?;
+            Some((id.to_string(), count.parse().ok().filter(|&c| c > 0)?))
+        })
+        .collect()
+}
+
+fn encode_counts(counts: &BTreeMap<String, u32>) -> Option<String> {
+    (!counts.is_empty()).then(|| counts.iter().map(|(id, count)| format!("{id}:{count}")).collect::<Vec<_>>().join(","))
 }
 
 impl Instance {
-    /// From the stack's `reforge`, `gems` and `upgrades` strings.
-    pub fn decode(reforge: Option<String>, gems: Option<String>, upgrades: Option<String>) -> Self {
+    /// From the stack's `reforge`, `gems`, `upgrades` and `progress` strings.
+    pub fn decode(reforge: Option<String>, gems: Option<String>, upgrades: Option<String>, progress: Option<String>) -> Self {
         let gems = gems
             .filter(|s| !s.is_empty())
             .map(|s| s.split(',').map(|id| (!id.is_empty()).then(|| id.to_string())).collect())
             .unwrap_or_default();
-        let upgrades = upgrades
-            .iter()
-            .flat_map(|s| s.split(','))
-            .filter_map(|entry| {
-                let (id, count) = entry.split_once(':')?;
-                Some((id.to_string(), count.parse().ok().filter(|&c| c > 0)?))
-            })
-            .collect();
-        Instance { reforge: reforge.filter(|s| !s.is_empty()), gems, upgrades }
+        Instance { reforge: reforge.filter(|s| !s.is_empty()), gems, upgrades: decode_counts(upgrades), progress: decode_counts(progress) }
     }
 
     /// The `gems` string: ids in socket order, comma separated, blank when
@@ -58,7 +68,16 @@ impl Instance {
 
     /// The `upgrades` string: "polish:7,shine:2". None when there are none.
     pub fn encode_upgrades(&self) -> Option<String> {
-        (!self.upgrades.is_empty()).then(|| self.upgrades.iter().map(|(id, count)| format!("{id}:{count}")).collect::<Vec<_>>().join(","))
+        encode_counts(&self.upgrades)
+    }
+
+    /// The `progress` string: "bloodlust:137". None when nothing has counted.
+    pub fn encode_progress(&self) -> Option<String> {
+        encode_counts(&self.progress)
+    }
+
+    pub fn progress_of(&self, id: &str) -> u32 {
+        self.progress.get(id).copied().unwrap_or(0)
     }
 
     pub fn upgrade_count(&self, id: &str) -> u32 {
@@ -121,10 +140,55 @@ pub struct UpgradeDef {
     /// Color codes for the name: the rarity of the item that applies this.
     /// Filled in by `link_upgrades`.
     pub color: String,
-    /// How many one item can take.
+    /// How many one item can take. For a growing upgrade, its highest level.
     pub max: u32,
+    /// Set on upgrades that level up on their own instead of being applied
+    /// `max` times.
+    pub growth: Option<Growth>,
     /// The first one that fits an item is the one it gets.
     pub bonuses: Vec<UpgradeBonus>,
+}
+
+/// What a growing upgrade counts. Only kills for now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Gain {
+    /// Kills by the player while the item is in its slot.
+    Kill,
+}
+
+impl Gain {
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "kill" => Some(Gain::Kill),
+            _ => None,
+        }
+    }
+}
+
+/// `gain "kill"` + `tiers 10 50 150`: applied once, the upgrade starts at
+/// level 1 and gains a level at each total in `tiers`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Growth {
+    pub gain: Gain,
+    /// Totals to reach, rising. Level 2 is at the first.
+    pub tiers: Vec<u32>,
+}
+
+impl Growth {
+    /// The level at this much progress, from 1.
+    pub fn level(&self, progress: u32) -> u32 {
+        1 + self.tiers.iter().filter(|&&tier| progress >= tier).count() as u32
+    }
+
+    /// The total the next level is at. None at the highest level.
+    pub fn next(&self, progress: u32) -> Option<u32> {
+        self.tiers.iter().copied().find(|&tier| progress < tier)
+    }
+
+    /// Nothing counts past the last tier, so a finished item is left alone.
+    pub fn cap(&self) -> u32 {
+        self.tiers.last().copied().unwrap_or(0)
+    }
 }
 
 /// What one application of an upgrade adds to the items it fits.
@@ -132,8 +196,21 @@ pub struct UpgradeDef {
 pub struct UpgradeBonus {
     pub slots: Vec<Slot>,
     pub kinds: Vec<String>,
+    /// Added once per level (or per application).
     pub stats: Stats,
     /// Plain stat name -> amount, split over the host's elements for that stat.
+    pub inherited: Stats,
+    /// `level 3 { ... }` blocks, rising. When there are any, they decide the
+    /// stats and `stats` is empty.
+    pub levels: Vec<LevelStats>,
+}
+
+/// `level 3 { ... }`: what the upgrade gives from that level on, until a
+/// higher block takes over.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LevelStats {
+    pub level: u32,
+    pub stats: Stats,
     pub inherited: Stats,
 }
 
@@ -141,23 +218,67 @@ impl UpgradeDef {
     pub fn bonus_for(&self, host: &ItemDef) -> Option<&UpgradeBonus> {
         self.bonuses.iter().find(|b| b.fits(host))
     }
+
+    /// How many times an upgrade item can be used on one item: a growing
+    /// upgrade is applied once and levels up from there.
+    pub fn applications(&self) -> u32 {
+        if self.growth.is_some() { 1 } else { self.max }
+    }
+}
+
+impl Instance {
+    /// Counts one `gain` on every growing upgrade of `host` that listens for
+    /// it and isn't finished. Returns the upgrades that changed, with the level
+    /// they reached if this was the one that got them there.
+    pub fn grow(&mut self, host: &ItemDef, gain: Gain, upgrade: impl Fn(&str) -> Option<Arc<UpgradeDef>>) -> Vec<(Arc<UpgradeDef>, Option<u32>)> {
+        let mut changed = Vec::new();
+        for id in self.upgrades.keys() {
+            let Some(def) = upgrade(id).filter(|u| u.bonus_for(host).is_some()) else { continue };
+            let Some(growth) = def.growth.as_ref().filter(|g| g.gain == gain) else { continue };
+            let before = self.progress.get(id).copied().unwrap_or(0);
+            if before >= growth.cap() {
+                continue;
+            }
+            self.progress.insert(id.clone(), before + 1);
+            let level = growth.level(before + 1);
+            changed.push((def.clone(), (level > growth.level(before)).then_some(level)));
+        }
+        changed
+    }
 }
 
 impl UpgradeBonus {
     fn fits(&self, host: &ItemDef) -> bool {
         host.is_relic()
             && filters_fit(&self.slots, &self.kinds, host)
-            && self.stats.keys().chain(self.inherited.keys()).all(|s| stat_fits(host, s))
+            && self.stat_names().all(|s| stat_fits(host, s))
+    }
+
+    /// Every stat this can add at some level.
+    pub fn stat_names(&self) -> impl Iterator<Item = &String> {
+        let levels = self.levels.iter().flat_map(|l| l.stats.keys().chain(l.inherited.keys()));
+        self.stats.keys().chain(self.inherited.keys()).chain(levels)
+    }
+
+    /// The `level` block in force at `count`: the highest at or below it.
+    /// None below the first.
+    fn at_level(&self, count: u32) -> Option<&LevelStats> {
+        self.levels.iter().rfind(|l| l.level <= count)
     }
 
     /// Adds `count` applications to `total`. `base` is the item's own stats, not
     /// what gems and reforges add, so socketing a fire gem can't change this.
     fn add_to(&self, total: &mut Stats, base: &Stats, count: u32) {
-        let count = f64::from(count);
-        for (stat, amount) in &self.stats {
+        // `level` blocks are totals for that level; plain `stats` are per level.
+        let (stats, inherited, count) = match self.at_level(count) {
+            Some(block) => (&block.stats, &block.inherited, 1.0),
+            None if !self.levels.is_empty() => return,
+            None => (&self.stats, &self.inherited, f64::from(count)),
+        };
+        for (stat, amount) in stats {
             *total.entry(stat.clone()).or_insert(0.0) += amount * count;
         }
-        for (stat, amount) in &self.inherited {
+        for (stat, amount) in inherited {
             for (key, share) in element_shares(base, stat) {
                 *total.entry(key).or_insert(0.0) += amount * count * share;
             }
@@ -229,6 +350,9 @@ pub enum SocketView {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpgradeView {
     Active { name: String, color: String, count: u32, max: u32 },
+    /// A growing upgrade: its level, what it has counted and the total the next
+    /// level is at (None at the highest).
+    Growing { name: String, color: String, level: u32, max: u32, progress: u32, next: Option<u32> },
     /// An upgrade that does nothing: deleted, or no longer fits after an edit.
     Inactive(String),
 }
@@ -285,7 +409,8 @@ impl ItemDef {
             add_stats(&mut out.stats, &g.stats);
             for (index, skill) in g.skills.iter().enumerate() {
                 let mut skill = skill.clone();
-                skill.cooldown_group = Some(format!("reliquary:{}.{index}", g.id));
+                // Per item: the same gem in a sword and a helmet procs on each.
+                skill.cooldown_group = Some(format!("reliquary:{}.{}.{index}", self.id, g.id));
                 out.skills.push(skill);
             }
             out.socket_views.push(SocketView::Filled(g.display_name()));
@@ -296,6 +421,22 @@ impl ItemDef {
                 out.upgrade_views.push(UpgradeView::Inactive(id.clone()));
                 continue;
             };
+            if let Some(growth) = &def.growth {
+                // The level comes from the count each time, so editing `tiers`
+                // moves existing items too.
+                let progress = instance.progress_of(id).min(growth.cap());
+                let level = growth.level(progress);
+                bonus.add_to(&mut out.stats, &self.stats, level);
+                out.upgrade_views.push(UpgradeView::Growing {
+                    name: def.name.clone(),
+                    color: def.color.clone(),
+                    level,
+                    max: def.max,
+                    progress,
+                    next: growth.next(progress),
+                });
+                continue;
+            }
             // Lowering `max` caps old items without forgetting what they had.
             let count = count.min(def.max);
             bonus.add_to(&mut out.stats, &self.stats, count);
@@ -320,6 +461,13 @@ impl ItemDef {
                 }
                 UpgradeView::Active { name, color, count, max } => {
                     texts.fill(&lore::UPGRADE_SHORT, &[("color", color), ("name", name), ("fill", &FILL), ("count", count), ("max", max)])
+                }
+                UpgradeView::Growing { name, color, level, max, progress, next: Some(next) } => texts.fill(
+                    &lore::UPGRADE_GROWING,
+                    &[("color", color), ("name", name), ("fill", &FILL), ("level", level), ("max", max), ("progress", progress), ("next", next)],
+                ),
+                UpgradeView::Growing { name, color, level, max, progress, next: None } => {
+                    texts.fill(&lore::UPGRADE_GROWN, &[("color", color), ("name", name), ("fill", &FILL), ("level", level), ("max", max), ("progress", progress)])
                 }
                 UpgradeView::Inactive(id) => texts.fill(&lore::UPGRADE_INACTIVE, &[("id", id)]),
             })
@@ -447,20 +595,20 @@ mod tests {
     #[test]
     fn instance_round_trips() {
         for gems in ["ruby", "ruby,,opal", ",opal"] {
-            let i = Instance::decode(None, Some(gems.to_string()), None);
+            let i = Instance::decode(None, Some(gems.to_string()), None, None);
             assert_eq!(i.encode_gems().as_deref(), Some(gems));
         }
-        let i = Instance::decode(Some("sharp".into()), Some("ruby,,opal".into()), None);
+        let i = Instance::decode(Some("sharp".into()), Some("ruby,,opal".into()), None, None);
         assert_eq!(i.gem(0), Some("ruby"));
         assert_eq!(i.gem(1), None);
         assert_eq!(i.gem(2), Some("opal"));
         assert_eq!(i.gem(9), None);
 
         // Nothing left in the sockets means nothing to store.
-        let mut i = Instance::decode(None, Some("ruby".into()), None);
+        let mut i = Instance::decode(None, Some("ruby".into()), None, None);
         i.set_gem(0, None);
         assert_eq!(i.encode_gems(), None);
-        assert_eq!(Instance::decode(Some(String::new()), Some(String::new()), Some(String::new())), Instance::default());
+        assert_eq!(Instance::decode(Some(String::new()), Some(String::new()), Some(String::new()), Some(String::new())), Instance::default());
     }
 
     #[test]
@@ -512,9 +660,10 @@ mod tests {
         let sword = apply(&all["sword"], &instance, &all);
         assert_eq!(sword.skills.len(), 1);
         assert_eq!(sword.skills[0].name, "Zap");
-        // The cooldown follows the gem, so it stays put whatever else is socketed.
-        assert_eq!(sword.skills[0].cooldown_group.as_deref(), Some("reliquary:spark.0"));
-        assert_eq!(crate::items::cooldown_group(&sword, 0), "reliquary:spark.0");
+        // The cooldown follows the gem, so it stays put whatever else is
+        // socketed, but each item has its own.
+        assert_eq!(sword.skills[0].cooldown_group.as_deref(), Some("reliquary:sword.spark.0"));
+        assert_eq!(crate::items::cooldown_group(&sword, 0), "reliquary:sword.spark.0");
     }
 
     #[test]
@@ -631,15 +780,168 @@ mod tests {
         }
     "#;
 
+    fn growing() -> Upgrades {
+        let src = "upgrade \"bloodlust\" {\n  name \"Bloodlust\"\n  gain \"kill\"\n  tiers 2 5 9\n  bonus {\n    kinds \"Sword\"\n    stats {\n      damage 1 element=\"inherit\"\n    }\n  }\n}\nupgrade \"polish\" {\n  name \"Polish\"\n  max 3\n  bonus {\n    stats {\n      health 1\n    }\n  }\n}";
+        link_upgrades(parse_upgrades("u.kdl", src).unwrap().0, &BTreeMap::new())
+    }
+
+    #[test]
+    fn growth_levels_follow_the_tiers() {
+        let u = growing();
+        let growth = u["bloodlust"].growth.as_ref().unwrap();
+        assert_eq!((u["bloodlust"].max, u["bloodlust"].applications()), (4, 1));
+        assert_eq!((u["polish"].max, u["polish"].applications()), (3, 3));
+        assert_eq!([0, 1, 2, 4, 5, 9, 500].map(|p| growth.level(p)), [1, 1, 2, 2, 3, 4, 4]);
+        assert_eq!([0, 2, 8, 9].map(|p| growth.next(p)), [Some(2), Some(5), Some(9), None]);
+    }
+
+    #[test]
+    fn kills_grow_only_applied_growing_upgrades_and_stop_at_the_cap() {
+        let u = growing();
+        let all = items(UPGRADE_SRC);
+        let sword = &all["sword"];
+        let find = |id: &str| u.get(id).cloned();
+
+        // Not applied: nothing counts.
+        let mut bare = Instance::default();
+        assert!(bare.grow(sword, Gain::Kill, find).is_empty());
+        assert_eq!(bare, Instance::default());
+
+        // Applied next to a normal upgrade: only the growing one counts.
+        let mut i = Instance { upgrades: [("bloodlust".to_string(), 1), ("polish".to_string(), 2)].into(), ..Default::default() };
+        let mut levels = Vec::new();
+        for _ in 0..12 {
+            for (def, level) in i.grow(sword, Gain::Kill, find) {
+                assert_eq!(def.id, "bloodlust");
+                levels.extend(level);
+            }
+        }
+        assert_eq!(levels, [2, 3, 4], "one level-up at each tier");
+        assert_eq!(i.progress_of("bloodlust"), 9, "stops at the last tier");
+        assert_eq!(i.progress_of("polish"), 0);
+        assert!(i.grow(sword, Gain::Kill, find).is_empty(), "a finished item is left alone");
+
+        // It doesn't fit a helmet, so it doesn't count there.
+        let mut helm = Instance { upgrades: [("bloodlust".to_string(), 1)].into(), ..Default::default() };
+        assert!(helm.grow(&all["fire_helm"], Gain::Kill, find).is_empty());
+    }
+
+    #[test]
+    fn growing_upgrades_add_their_bonus_per_level() {
+        let u = growing();
+        let all = items(UPGRADE_SRC);
+        let with = |progress: u32| {
+            let instance = Instance { upgrades: [("bloodlust".to_string(), 1)].into(), progress: [("bloodlust".to_string(), progress)].into_iter().filter(|(_, p)| *p > 0).collect(), ..Default::default() };
+            all["sword"].with_instance(&instance, |_| None, |_| None, |id| u.get(id).cloned())
+        };
+        let base = crate::items::stat_total(&all["sword"].stats, "damage");
+        let damage = |progress: u32| crate::items::stat_total(&with(progress).stats, "damage") - base;
+        assert_eq!([0, 1, 2, 5, 9, 50].map(damage), [1.0, 1.0, 2.0, 3.0, 4.0, 4.0]);
+        assert_eq!(with(3).upgrade_views[0], UpgradeView::Growing { name: "Bloodlust".into(), color: "&7".into(), level: 2, max: 4, progress: 3, next: Some(5) });
+        // Past the cap (tiers were lowered): shown and counted as finished.
+        assert_eq!(with(50).upgrade_views[0], UpgradeView::Growing { name: "Bloodlust".into(), color: "&7".into(), level: 4, max: 4, progress: 9, next: None });
+    }
+
+    #[test]
+    fn growing_lore_shows_progress_then_max() {
+        let u = growing();
+        let all = items(UPGRADE_SRC);
+        let formats = StatFormats::default();
+        let lines = |progress: u32| {
+            let instance = Instance { upgrades: [("bloodlust".to_string(), 1)].into(), progress: [("bloodlust".to_string(), progress)].into(), ..Default::default() };
+            all["sword"].with_instance(&instance, |_| None, |_| None, |id| u.get(id).cloned()).upgrade_lines(&formats)
+        };
+        let plain = |line: &str| line.replace(FILL, "|");
+        assert!(plain(&lines(3)[0]).ends_with("3/5"), "{:?}", lines(3));
+        assert!(plain(&lines(3)[0]).contains("Bloodlust 2"), "{:?}", lines(3));
+        assert!(plain(&lines(9)[0]).ends_with("Max"), "{:?}", lines(9));
+    }
+
+    fn leveled(body: &str) -> Upgrades {
+        let src = format!("upgrade \"bloodlust\" {{\n  name \"Bloodlust\"\n  gain \"kill\"\n  tiers 2 5 9 20 40\n  bonus {{\n    kinds \"Sword\"\n{body}\n  }}\n}}");
+        link_upgrades(parse_upgrades("u.kdl", &src).unwrap().0, &BTreeMap::new())
+    }
+
+    #[test]
+    fn level_blocks_replace_and_carry_on() {
+        // Level 1 has nothing, 2 starts, 3 and 4 replace, 5 and 6 carry on.
+        let u = leveled("    level 2 {\n      damage 1 element=\"inherit\"\n    }\n    level 3 {\n      health 5\n    }\n    level 4 {\n      damage 7 element=\"inherit\"\n      health 1\n    }");
+        let all = items(UPGRADE_SRC);
+        let sword = &all["sword"];
+        let gained = |progress: u32| {
+            let instance = Instance { upgrades: [("bloodlust".to_string(), 1)].into(), progress: [("bloodlust".to_string(), progress)].into_iter().filter(|(_, p)| *p > 0).collect(), ..Default::default() };
+            let got = sword.with_instance(&instance, |_| None, |_| None, |id| u.get(id).cloned());
+            let damage = crate::items::stat_total(&got.stats, "damage") - crate::items::stat_total(&sword.stats, "damage");
+            (damage, got.stats.get("health").copied().unwrap_or(0.0))
+        };
+        // progress 0, 2, 5, 9, 20, 40 are levels 1 to 6.
+        assert_eq!([0, 2, 5, 9, 20, 40].map(gained), [(0.0, 0.0), (1.0, 0.0), (0.0, 5.0), (7.0, 1.0), (7.0, 1.0), (7.0, 1.0)]);
+
+        // Inherited stats still follow the sword's 5 neutral + 2 fire.
+        let instance = Instance { upgrades: [("bloodlust".to_string(), 1)].into(), progress: [("bloodlust".to_string(), 9)].into(), ..Default::default() };
+        let got = sword.with_instance(&instance, |_| None, |_| None, |id| u.get(id).cloned());
+        assert_eq!((got.stats["damage"], got.stats["damage.fire"]), (10.0, 4.0));
+    }
+
+    #[test]
+    fn level_blocks_work_on_applied_upgrades_too() {
+        let src = "upgrade \"polish\" {\n  name \"Polish\"\n  max 3\n  bonus {\n    level 1 {\n      health 1\n    }\n    level 3 {\n      health 10\n    }\n  }\n}";
+        let u = link_upgrades(parse_upgrades("u.kdl", src).unwrap().0, &BTreeMap::new());
+        let all = items(UPGRADE_SRC);
+        let health = |count: u32| all["cap"].with_instance(&polished(count), |_| None, |_| None, |id| u.get(id).cloned()).stats["health"];
+        assert_eq!([1, 2, 3, 9].map(health), [1.0, 1.0, 10.0, 10.0]);
+    }
+
+    #[test]
+    fn level_blocks_are_checked_when_loading() {
+        let bad = |body: &str| {
+            let src = format!("upgrade \"a\" {{\n  name \"A\"\n  gain \"kill\"\n  tiers 5 10\n  bonus {{\n{body}\n  }}\n}}");
+            parse_upgrades("u", &src).unwrap_err().to_string()
+        };
+        let one = "level 1 {\n health 1\n }";
+        assert!(bad(&format!("stats {{\n health 1\n }}\n {one}")).contains("either `stats`"));
+        assert!(bad(&format!("{one}\n {one}")).contains("rising order"));
+        assert!(bad("level 2 {\n health 1\n }\n level 1 {\n health 1\n }").contains("rising order"));
+        assert!(bad("level 0 {\n health 1\n }").contains("rising order"));
+        assert!(bad("level 1 add=#true {\n health 1\n }").contains("it takes no options"));
+        assert!(bad("level 4 {\n health 1\n }").contains("only goes up to level 3"));
+        assert!(bad("level 1 {\n }").contains("needs `stats`"));
+        assert!(bad("slots \"head\"\n level 1 {\n damage 1\n }").contains("only works on main-hand items"));
+        // A sword-only stat in any level keeps the bonus off a helmet.
+        let u = leveled("    level 1 {\n      health 1\n    }\n    level 2 {\n      damage 1\n    }");
+        assert!(u["bloodlust"].bonuses[0].stat_names().any(|s| s == "damage"));
+    }
+
+    #[test]
+    fn progress_round_trips_on_the_stack() {
+        let i = Instance::decode(None, None, Some("bloodlust:1".into()), Some("bloodlust:137,junk,zero:0".into()));
+        assert_eq!(i.progress_of("bloodlust"), 137);
+        assert_eq!(i.encode_progress().as_deref(), Some("bloodlust:137"));
+        assert_eq!(Instance::default().encode_progress(), None);
+    }
+
+    #[test]
+    fn growing_upgrades_are_checked_when_loading() {
+        let bad = |body: &str| parse_upgrades("u", &format!("upgrade \"a\" {{\n  name \"A\"\n{body}\n  bonus {{\n    stats {{\n      health 1\n    }}\n  }}\n}}")).unwrap_err().to_string();
+        assert!(bad("  max 3\n  gain \"kill\"\n  tiers 5").contains("both `max` and"), "{}", bad("  max 3\n  gain \"kill\"\n  tiers 5"));
+        assert!(bad("  gain \"kill\"").contains("no `tiers`"));
+        assert!(bad("  tiers 5 10").contains("no `gain`"));
+        assert!(bad("  gain \"mine\"\n  tiers 5").contains("unknown `gain`"));
+        assert!(bad("  gain \"kill\"\n  tiers 5 5").contains("higher than the one before"));
+        assert!(bad("  gain \"kill\"\n  tiers 0 5").contains("higher than the one before"));
+        assert!(bad("  gain \"kill\"\n  tiers").contains("at least one"));
+        assert!(bad("").contains("needs a `max`, or `gain` and `tiers`"));
+    }
+
     #[test]
     fn upgrade_counts_round_trip() {
-        let i = Instance::decode(None, None, Some("polish:7,shine:2".into()));
+        let i = Instance::decode(None, None, Some("polish:7,shine:2".into()), None);
         assert_eq!(i.upgrade_count("polish"), 7);
         assert_eq!(i.upgrade_count("shine"), 2);
         assert_eq!(i.upgrade_count("gone"), 0);
         assert_eq!(i.encode_upgrades().as_deref(), Some("polish:7,shine:2"));
         // Junk reads as nothing rather than breaking the item.
-        assert_eq!(Instance::decode(None, None, Some("polish,shine:x,glow:0".into())), Instance::default());
+        assert_eq!(Instance::decode(None, None, Some("polish,shine:x,glow:0".into()), None), Instance::default());
         assert_eq!(Instance::default().encode_upgrades(), None);
     }
 

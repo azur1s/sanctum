@@ -22,6 +22,23 @@
 //
 // Stacks hold only the count, so editing an upgrade changes every item that has
 // it. Lowering `max` caps items that are over it; raising it again gives it back.
+//
+// Growing upgrades: `gain` and `tiers` in place of `max`. The upgrade item is
+// used once and puts it at level 1; from then on it levels up on its own.
+// gain    What it counts. "kill": kills by the player with the item in its slot,
+//         whatever dealt the last hit (the same credit as `trigger "kill"`).
+// tiers   The totals to reach, each higher than the last. Level 2 is at the
+//         first, so `tiers 10 50 150` has 4 levels.
+// The count is saved on the item and follows it when traded; it stops at the
+// last tier. The level is worked out from the count, so editing `tiers` moves
+// items that already exist.
+//
+// What a level gives: a bonus has either `stats` or `level` blocks.
+//   stats { ... }        Added once per level (or per one applied, with `max`).
+//   level 3 { ... }      Everything the upgrade gives from level 3 on, in place
+//                        of the block before it. A level without a block keeps
+//                        the last one, and levels below the first give nothing.
+// `level` blocks work with `max` too: the level is how many were applied.
 
 upgrade "polish" {
     name "Polish"
@@ -38,6 +55,37 @@ upgrade "polish" {
         stats {
             health 0.5
             defense 1 element="inherit"
+        }
+    }
+}
+
+upgrade "bloodlust" {
+    name "Bloodlust"
+    gain "kill"
+    tiers 10 50 150 400 1000
+
+    bonus {
+        kinds "Sword"
+        level 1 {
+            damage 1 element="inherit"
+        }
+        // In place of level 1, so it repeats the damage.
+        level 2 {
+            damage 1 element="inherit"
+            crit-chance 5
+        }
+        level 3 {
+            damage 2 element="inherit"
+            crit-chance 10
+        }
+        level 4 {
+            damage 3 element="inherit"
+            crit-chance 15
+        }
+        // Level 6 has no block, so it stays at this.
+        level 5 {
+            damage 4 element="inherit"
+            crit-chance 20
         }
     }
 }

@@ -99,3 +99,7 @@ upgrade-gone "&cThat upgrade no longer exists."
 upgrade-doesnt-fit "&c{upgrade} doesn't work on {item}."
 upgrade-maxed "&c{item} already has the most {upgrade} it can take ({max})."
 upgraded "&aApplied {upgrade} &ato {item} ({count}/{max})"
+// Upgrades that level up on their own.
+upgrade-already "&c{item} already has {upgrade}."
+upgrade-started "&aApplied {upgrade} &ato {item}&a. Next level at {next}."
+upgrade-grew "{color}{upgrade} &7on {item} &7reached level {color}{level}&7/{max}"

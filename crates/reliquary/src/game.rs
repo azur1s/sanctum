@@ -31,7 +31,7 @@ use tracing::{info, warn};
 use crate::config::{self, Config};
 use crate::engine::{self, Cast, text};
 use crate::files;
-use crate::items::{self, DamageKind, Elements, Instance, ItemDef, Params, PlayerStats, ReforgeDef, Reforges, Scope, Slot, StatFormats, Trigger, UpgradeDef, Upgrades, forge};
+use crate::items::{self, DamageKind, Elements, Gain, Instance, ItemDef, Params, PlayerStats, ReforgeDef, Reforges, Scope, Slot, StatFormats, Trigger, UpgradeDef, Upgrades, forge};
 use crate::texts::{self, Key, Sheet, Vars, messages as m, msg};
 use crate::{mana, stats};
 
@@ -420,7 +420,7 @@ fn base_armor_id(slot: Slot) -> Option<&'static str> {
 
 /// What this stack has on top of its definition.
 pub(crate) fn instance_of(stack: &ItemStack) -> Instance {
-    Instance::decode(stack.get_string(NS, "reforge"), stack.get_string(NS, "gems"), stack.get_string(NS, "upgrades"))
+    Instance::decode(stack.get_string(NS, "reforge"), stack.get_string(NS, "gems"), stack.get_string(NS, "upgrades"), stack.get_string(NS, "progress"))
 }
 
 fn reforge(id: &str) -> Option<Arc<ReforgeDef>> {
@@ -469,6 +469,10 @@ pub(crate) fn build_stack(base: &ItemDef, instance: &Instance, count: u8, stats:
     if def.fake_enchant {
         stack.set_component(DataComponent::EnchantmentGlintOverride, &[1]);
     }
+    // dyed_color: one big-endian int, 0xRRGGBB.
+    if let Some((r, g, b)) = def.color {
+        stack.set_component(DataComponent::DyedColor, &[0, r, g, b]);
+    }
     // Stats backed by vanilla attributes. The player has 1 base damage and
     // 4 base attack speed; the tooltip shows totals, so store the difference
     // under the vanilla ids to replace the base item's own values.
@@ -504,6 +508,11 @@ pub(crate) fn build_stack(base: &ItemDef, instance: &Instance, count: u8, stats:
         display[1] += 1;
         display.push(DataComponent::Unbreakable as u8);
     }
+    // The client's "Dyed" line says nothing the item's look doesn't.
+    if def.color.is_some() {
+        display[1] += 1;
+        display.push(DataComponent::DyedColor as u8);
+    }
     stack.set_component(DataComponent::TooltipDisplay, &display);
     stack.set_string(NS, "id", &def.id);
     if let Some(reforge) = &instance.reforge {
@@ -514,6 +523,9 @@ pub(crate) fn build_stack(base: &ItemDef, instance: &Instance, count: u8, stats:
     }
     if let Some(upgrades) = instance.encode_upgrades() {
         stack.set_string(NS, "upgrades", &upgrades);
+    }
+    if let Some(progress) = instance.encode_progress() {
+        stack.set_string(NS, "progress", &progress);
     }
     stack
 }
@@ -583,6 +595,46 @@ fn refresh_inventory(player: &Player) {
     }
 }
 
+/// Counts one `gain` (a kill) on the growing upgrades of everything the player
+/// has in its slot, and rebuilds the items that changed so their lore and stats
+/// follow.
+pub(crate) fn grow_upgrades(player: &Player, gain: Gain) {
+    let inv = player.get_inventory();
+    let slots = [
+        (Slot::MainHand, player.get_item_in_hand(Hand::Right)),
+        (Slot::OffHand, inv.get_off_hand()),
+        (Slot::Head, inv.get_helmet()),
+        (Slot::Chest, inv.get_chestplate()),
+        (Slot::Legs, inv.get_leggings()),
+        (Slot::Feet, inv.get_boots()),
+    ];
+    for (slot, stack) in slots {
+        let Some(stack) = stack else { continue };
+        let Some(def) = stack.get_string(NS, "id").and_then(|id| item(&id)).filter(|d| d.is_relic() && d.slot == slot) else { continue };
+        let mut instance = instance_of(&stack);
+        let changed = instance.grow(&def, gain, upgrade);
+        if changed.is_empty() {
+            continue;
+        }
+        let rebuilt = build_stack(&def, &instance, stack.get_count(), &stats::current(player));
+        keep_damage(&stack, &rebuilt);
+        match slot {
+            Slot::MainHand => player.set_item_in_hand(Hand::Right, Some(rebuilt)),
+            Slot::OffHand => player.set_item_in_hand(Hand::Left, Some(rebuilt)),
+            Slot::Head => inv.set_helmet(Some(rebuilt)),
+            Slot::Chest => inv.set_chestplate(Some(rebuilt)),
+            Slot::Legs => inv.set_leggings(Some(rebuilt)),
+            Slot::Feet => inv.set_boots(Some(rebuilt)),
+        }
+        for (grown, level) in changed {
+            if let Some(level) = level {
+                let name = apply_instance(&def, &instance).display_name();
+                player.send_system_message(text(&msg(&m::UPGRADE_GREW, &[("color", &grown.color), ("upgrade", &grown.name), ("item", &name), ("level", &level), ("max", &grown.max)])), false);
+            }
+        }
+    }
+}
+
 fn max_mana(stats: &PlayerStats) -> u32 {
     stats.get("max_mana").copied().unwrap_or(0.0).max(0.0) as u32
 }
@@ -624,7 +676,7 @@ fn fire_from(
     }
     let key = player_key(&player);
     let stats = Arc::new(stats::for_cast(&player));
-    let cast = Cast { server, caster: player, victim: other, params: Default::default(), stats: stats.clone(), from_proc };
+    let cast = Cast { server, caster: player, victim: other, params: Default::default(), stats: stats.clone(), from_proc, counters: Default::default() };
     let mut used = false;
     for def in items {
         for (index, skill) in def.skills.iter().enumerate() {
@@ -643,19 +695,26 @@ fn fire_from(
 pub(crate) fn proc_hit(server: &Server, caster: &Player, target: &Entity) {
     let key = player_key(caster);
     let Some(player) = server.get_all_players().into_iter().find(|p| player_key(p) == key) else { return };
-    let Some(def) = held_relic(&player) else { return };
     let id = target.get_id();
     let victim = player.as_entity().get_nearby_entities(32.0, 32.0, 32.0).into_iter().find(|e| e.get_id() == id);
     if victim.is_some() {
-        fire_from(server, player, victim, &[def], |t| t == Trigger::Hit, true);
+        fire_hit(server, player, victim, true);
     }
 }
 
-/// Fires `trigger` on the relic in the main hand (clicks and melee hits).
+/// Fires `trigger` on the relic in the main hand (clicks).
 fn fire_held(server: &Server, player: Player, other: Option<Entity>, trigger: Trigger) {
     let Some(def) = held_relic(&player) else { return };
-    // A skill started by a hit never causes another hit (`triggers-hit`).
-    fire_from(server, player, other, &[def], |t| t == trigger, trigger == Trigger::Hit);
+    fire_from(server, player, other, &[def], |t| t == trigger, false);
+}
+
+/// Runs the `hit` skills of everything equipped (weapon, offhand, armor), so
+/// armor procs on any melee hit, bare-fisted too. They stack; each keeps its
+/// own cooldown. `from_proc`: started by `triggers-hit`, so it never causes
+/// another hit.
+fn fire_hit(server: &Server, player: Player, victim: Option<Entity>, from_proc: bool) {
+    let items: Vec<_> = stats::equipped(&player).into_iter().map(|s| s.item).collect();
+    fire_from(server, player, victim, &items, |t| t == Trigger::Hit, from_proc);
 }
 
 // ---- Commands -------------------------------------------------------------------
@@ -1017,8 +1076,11 @@ impl CommandHandler for Upgrade {
             return Err(fail(&m::UPGRADE_DOESNT_FIT, &[("upgrade", &upgrade_item.name), ("item", &def.name)]));
         }
         let count = instance.upgrade_count(&chosen.id);
-        if count >= chosen.max {
-            return Err(fail(&m::UPGRADE_MAXED, &[("item", &def.name), ("upgrade", &chosen.name), ("max", &chosen.max)]));
+        if count >= chosen.applications() {
+            return Err(match chosen.growth {
+                Some(_) => fail(&m::UPGRADE_ALREADY, &[("item", &def.name), ("upgrade", &chosen.name)]),
+                None => fail(&m::UPGRADE_MAXED, &[("item", &def.name), ("upgrade", &chosen.name), ("max", &chosen.max)]),
+            });
         }
 
         instance.upgrades.insert(chosen.id.clone(), count + 1);
@@ -1026,7 +1088,13 @@ impl CommandHandler for Upgrade {
         let left = off_hand.get_count().saturating_sub(1);
         let rest = (left > 0).then(|| build_stack(&upgrade_item, &Instance::default(), left, &stats::current(&player)));
         player.set_item_in_hand(Hand::Left, rest);
-        say(&sender, &m::UPGRADED, &[("upgrade", &upgrade_item.display_name()), ("item", &def.display_name()), ("count", &(count + 1)), ("max", &chosen.max)]);
+        match &chosen.growth {
+            Some(growth) => {
+                let next = growth.next(instance.progress_of(&chosen.id)).map_or_else(|| "-".to_string(), |n| n.to_string());
+                say(&sender, &m::UPGRADE_STARTED, &[("upgrade", &upgrade_item.display_name()), ("item", &def.display_name()), ("next", &next)]);
+            }
+            None => say(&sender, &m::UPGRADED, &[("upgrade", &upgrade_item.display_name()), ("item", &def.display_name()), ("count", &(count + 1)), ("max", &chosen.max)]),
+        }
         Ok(1)
     }
 }
@@ -1072,11 +1140,14 @@ impl CommandSuggestionHandler for ItemIds {
 struct OnInteract;
 impl EventHandler<PlayerInteractEvent> for OnInteract {
     fn handle(&self, server: Server, event: EventData<PlayerInteractEvent>) -> EventData<PlayerInteractEvent> {
-        let trigger = match event.action {
-            InteractAction::RightClickAir | InteractAction::RightClickBlock => Trigger::RightClick,
-            InteractAction::LeftClickAir | InteractAction::LeftClickBlock => Trigger::LeftClick,
-        };
         let player = event.player.as_entity();
+        let sneaking = player.is_sneaking();
+        let trigger = match (event.action, sneaking) {
+            (InteractAction::RightClickAir | InteractAction::RightClickBlock, false) => Trigger::RightClick,
+            (InteractAction::RightClickAir | InteractAction::RightClickBlock, true) => Trigger::SneakRightClick,
+            (InteractAction::LeftClickAir | InteractAction::LeftClickBlock, false) => Trigger::LeftClick,
+            (InteractAction::LeftClickAir | InteractAction::LeftClickBlock, true) => Trigger::SneakLeftClick,
+        };
         if let Some(player) = server.get_all_players().into_iter().find(|p| p.as_entity().get_id() == player.get_id()) {
             fire_held(&server, player, None, trigger);
         }
@@ -1128,7 +1199,9 @@ impl EventHandler<EntityDamageByEntityEvent> for OnHit {
                 .into_iter()
                 .find(|e| e.get_id() as i32 == event.entity_id);
             if victim.is_some() {
-                fire_held(&server, player, victim, Trigger::Hit);
+                engine::begin_hit_fold(event.entity_id as u32);
+                fire_hit(&server, player, victim, false);
+                event.damage += engine::end_hit_fold() as f32;
             }
         }
         event
@@ -1148,6 +1221,7 @@ impl EventHandler<PlayerLeaveEvent> for OnLeave {
     fn handle(&self, _: Server, event: EventData<PlayerLeaveEvent>) -> EventData<PlayerLeaveEvent> {
         stats::forget(&event.player);
         crate::triggers::forget(&player_key(&event.player));
+        crate::counters::forget(&player_key(&event.player));
         save_mana();
         event
     }

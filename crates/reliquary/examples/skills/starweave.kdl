@@ -1,6 +1,7 @@
 // Skills for the Starweave armor set. Armor and offhand items can use every
-// trigger except clicks and melee hits (those come from the main hand):
-//   damaged, kill, sneak, timer every="5s", equip, unequip
+// trigger except clicks (those come from the main hand):
+//   hit, damaged, kill, sneak, timer every="5s", equip, unequip
+// `hit` runs on any melee hit, bare-fisted too, and stacks with the weapon's.
 
 skill "starlight_ward" {
     name "Starlight Ward"

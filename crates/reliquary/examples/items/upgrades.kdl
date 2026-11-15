@@ -11,3 +11,13 @@ item "polish" {
     lore "Brings out the shine, and then some."
     upgrade "polish"
 }
+
+// A growing upgrade: used once, then it levels up from kills.
+item "bloodlust" {
+    name "Bloodlust"
+    kind "Consumable"
+    base "minecraft:redstone"
+    rarity "epic"
+    lore "It remembers every one of them."
+    upgrade "bloodlust"
+}

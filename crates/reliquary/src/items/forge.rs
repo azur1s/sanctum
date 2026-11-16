@@ -329,7 +329,7 @@ pub fn gem_problem(host: &ItemDef, socket: usize, gem: &ItemDef) -> Option<Strin
         return Some(msg(&messages::GEM_STAT_MAIN_HAND, &[("gem", &gem.name), ("stat", &stat.replace('_', "-"))]));
     }
     if host.slot != Slot::MainHand
-        && let Some(skill) = gem.skills.iter().find(|s| s.skill.trigger.main_hand_only())
+        && let Some(skill) = gem.skills.iter().find(|s| s.skill.triggers.iter().any(|t| t.main_hand_only()))
     {
         return Some(msg(&messages::GEM_SKILL_MAIN_HAND, &[("gem", &gem.name), ("skill", &skill.name)]));
     }

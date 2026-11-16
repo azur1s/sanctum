@@ -878,6 +878,7 @@ impl Parser<'_> {
         let mut stat_at = Vec::new();
         let mut uses = Vec::new();
         let (mut sockets, mut gem, mut reforgeable) = (Vec::new(), None, true);
+        let mut ranged = None;
         let mut upgrade = None;
         let (mut unbreakable, mut hide_unbreakable, mut fake_enchant) = (false, false, false);
         let mut color = None;
@@ -902,6 +903,10 @@ impl Parser<'_> {
                 "fake-enchant" => {
                     self.shape(child, 1, &[], false)?;
                     fake_enchant = self.boolean(self.arg(child, 0, "#true or #false")?)?;
+                }
+                "ranged" => {
+                    self.shape(child, 1, &[], false)?;
+                    ranged = Some(self.boolean(self.arg(child, 0, "#true or #false")?)?);
                 }
                 "color" => {
                     self.shape(child, 1, &[], false)?;
@@ -976,10 +981,13 @@ impl Parser<'_> {
             }
         }
 
+        // Bows and crossbows shoot on their own, so they are ranged unless told otherwise.
+        let ranged = ranged.unwrap_or_else(|| matches!(base.strip_prefix("minecraft:").unwrap_or(&base), "bow" | "crossbow"));
         let item = ItemDef {
             sockets,
             gem,
             reforgeable,
+            ranged,
             unbreakable,
             hide_unbreakable,
             fake_enchant,
@@ -1183,7 +1191,7 @@ impl Parser<'_> {
             match key.value() {
                 "name" => u.name = Some(self.string(entry)?),
                 "mana" => u.mana_cost = Some(self.whole(entry)?),
-                "cooldown" => u.cooldown = Some(self.number(entry)? as f32),
+                "cooldown" => u.cooldown = Some(self.num(entry)?),
                 "chance" => u.chance = Some(self.chance(entry)?),
                 "trigger" => {
                     let value = self.string(entry)?;
@@ -1217,16 +1225,17 @@ impl Parser<'_> {
         self.used_params.borrow_mut().clear();
         self.loop_vars.borrow_mut().clear();
         self.used_counters.borrow_mut().clear();
-        let mut trigger = None;
+        let mut triggers: Option<Vec<Trigger>> = None;
         let mut counter_at = Vec::new();
         let mut skill = SkillDef {
             name: id.clone(),
             id,
             description: Vec::new(),
-            trigger: Trigger::RightClick,
+            triggers: Vec::new(),
             chance: 1.0,
             mana_cost: 0,
-            cooldown: 0.0,
+            cooldown: Num::Lit(0.0),
+            quiet: false,
             params: Params::new(),
             conditions: Vec::new(),
             actions: Arc::default(),
@@ -1245,31 +1254,43 @@ impl Parser<'_> {
                     }
                 }
                 "trigger" => {
-                    self.shape(child, 1, &["every"], false)?;
-                    let value = self.string(self.arg(child, 0, "a trigger")?)?;
+                    if triggers.is_some() {
+                        return Err(self.at(child, "a skill has one `trigger` line; list several on it, like `trigger \"left_click\" \"right_click\"`"));
+                    }
+                    self.shape(child, usize::MAX, &["every"], false)?;
+                    self.arg(child, 0, "a trigger")?;
                     let every = prop(child, "every");
-                    let parsed = match simple_trigger(&value) {
-                        Some(t) => t,
-                        None if value == "timer" => {
-                            let entry = every.ok_or_else(|| self.at(child, "`trigger \"timer\"` needs `every=`, like every=\"5s\""))?;
-                            let Num::Lit(ticks) = self.ticks(entry)? else {
-                                return Err(self.at_entry(entry, "`every=` must be a fixed time, not a formula"));
-                            };
-                            if ticks < 20.0 || ticks % 20.0 != 0.0 {
-                                return Err(self.at_entry(entry, "timers run in whole seconds, like every=\"5s\""));
+                    let mut parsed = Vec::new();
+                    for entry in args(child) {
+                        let value = self.string(entry)?;
+                        let trigger = match simple_trigger(&value) {
+                            Some(t) => t,
+                            None if value == "timer" => {
+                                let e = every.ok_or_else(|| self.at(child, "`trigger \"timer\"` needs `every=`, like every=\"5s\""))?;
+                                let Num::Lit(ticks) = self.ticks(e)? else {
+                                    return Err(self.at_entry(e, "`every=` must be a fixed time, not a formula"));
+                                };
+                                if ticks < 20.0 || ticks % 20.0 != 0.0 {
+                                    return Err(self.at_entry(e, "timers run in whole seconds, like every=\"5s\""));
+                                }
+                                Trigger::Timer((ticks / 20.0) as u32)
                             }
-                            Trigger::Timer((ticks / 20.0) as u32)
+                            _ => {
+                                return Err(self.at_entry(entry, format!(
+                                    "unknown trigger `{value}` (expected right_click, left_click, sneak_right_click, sneak_left_click, hit, damaged, kill, sneak, timer, equip or unequip)"
+                                )));
+                            }
+                        };
+                        if parsed.contains(&trigger) {
+                            return Err(self.at_entry(entry, format!("trigger `{value}` is listed twice")));
                         }
-                        _ => {
-                            return Err(self.at(child, format!(
-                                "unknown trigger `{value}` (expected right_click, left_click, sneak_right_click, sneak_left_click, hit, damaged, kill, sneak, timer, equip or unequip)"
-                            )));
-                        }
-                    };
-                    if let (Some(e), false) = (every, matches!(parsed, Trigger::Timer(_))) {
+                        parsed.push(trigger);
+                    }
+                    let timers = parsed.iter().filter(|t| matches!(t, Trigger::Timer(_))).count();
+                    if let (Some(e), 0) = (every, timers) {
                         return Err(self.at_entry(e, "`every=` only goes with `trigger \"timer\"`"));
                     }
-                    trigger = Some(parsed);
+                    triggers = Some(parsed);
                 }
                 "param" => {
                     self.shape(child, 2, &[], false)?;
@@ -1294,7 +1315,14 @@ impl Parser<'_> {
                     self.shape(child, 0, &["mana"], false)?;
                     skill.mana_cost = self.opt(child, "mana", |e| self.whole(e))?.unwrap_or(0);
                 }
-                "cooldown" => skill.cooldown = self.num_arg(child, "seconds")? as f32,
+                "cooldown" => {
+                    self.shape(child, 1, &[], false)?;
+                    skill.cooldown = self.num(self.arg(child, 0, "seconds, or a formula like \"1 / self.attack_speed\"")?)?;
+                }
+                "quiet" => {
+                    self.shape(child, 1, &[], false)?;
+                    skill.quiet = self.boolean(self.arg(child, 0, "#true or #false")?)?;
+                }
                 "on-fail" => {
                     self.shape(child, 0, &[], true)?;
                     skill.on_fail = self.actions(children(child), false)?;
@@ -1302,7 +1330,7 @@ impl Parser<'_> {
                 _ => actions.push(self.action(child, false)?),
             }
         }
-        skill.trigger = trigger.ok_or_else(|| self.at(node, format!("skill `{}` needs a `trigger`", skill.id)))?;
+        skill.triggers = triggers.ok_or_else(|| self.at(node, format!("skill `{}` needs a `trigger`", skill.id)))?;
         skill.actions = Arc::new(actions);
 
         for (var, offset) in self.loop_vars.borrow().iter() {
@@ -1474,6 +1502,10 @@ impl Parser<'_> {
                     hit,
                     end,
                 });
+            }
+            "arrow" => {
+                self.shape(node, 0, &["speed", "arc"], false)?;
+                return Ok(Action::Arrow { speed: self.opt_num(node, "speed", 3.0)?, arc: self.opt_num(node, "arc", 0.0)? });
             }
             "chain" => {
                 if on_points {
@@ -1724,6 +1756,7 @@ mod tests {
             include_str!("../../examples/skills/blades.kdl"),
             include_str!("../../examples/skills/storm.kdl"),
             include_str!("../../examples/skills/starweave.kdl"),
+            include_str!("../../examples/skills/archery.kdl"),
         ] {
             for skill in parse_file("lib", src).unwrap().skills {
                 lib.insert(skill.id.clone(), Arc::new(skill));
@@ -1770,8 +1803,8 @@ mod tests {
         assert_eq!(moon.slot, Slot::MainHand);
         assert_eq!(moon.skills.len(), 3);
         assert_eq!(moon.skills[0].name, "Moon Slash");
-        assert_eq!(moon.skills[1].skill.trigger, Trigger::LeftClick);
-        assert_eq!(moon.skills[2].skill.trigger, Trigger::Hit);
+        assert_eq!(moon.skills[1].skill.triggers, [Trigger::LeftClick]);
+        assert_eq!(moon.skills[2].skill.triggers, [Trigger::Hit]);
 
         let storm = item(include_str!("../../examples/items/stormcaller.kdl"));
         let thunder = &storm.skills[0];
@@ -2068,9 +2101,58 @@ mod tests {
     }
 
     #[test]
+    fn bows() {
+        let file = include_str!("../../examples/items/bows.kdl");
+        let mut parsed = parse_file("bows.kdl", file).unwrap();
+        let shortbow = link(parsed.items.remove(1), &library(), &rarities()).unwrap();
+        let longbow = link(parsed.items.remove(0), &library(), &rarities()).unwrap();
+        assert!(longbow.ranged, "built on a bow, so ranged without saying so");
+        assert!(shortbow.ranged);
+        assert!(!item(include_str!("../../examples/items/moonlit_edge.kdl")).ranged);
+
+        let shot = &shortbow.skills[0];
+        assert_eq!(shot.skill.triggers, [Trigger::LeftClick, Trigger::RightClick]);
+        assert!(shot.skill.quiet && !shot.skill.notices());
+        assert!(matches!(shot.skill.actions[1], Action::Arrow { .. }));
+        let volley = &library()["volley"];
+        assert!(matches!(&volley.actions[1], Action::Arrow { arc: Num::Lit(a), .. } if *a == -12.0), "{:?}", volley.actions[1]);
+        assert!(matches!(&volley.actions[2], Action::Arrow { arc: Num::Lit(a), .. } if *a == 0.0));
+
+        // The cooldown follows attack speed: 1 / 1.2 s.
+        let stats = PlayerStats::from([("attack_speed".to_string(), 1.2)]);
+        let seconds = cooldown_seconds(&shot.cooldown, Scope { params: &shot.params, stats: &stats }).unwrap();
+        assert!((seconds - 1.0 / 1.2).abs() < 1e-9);
+        // No attack speed: no cooldown, not an infinite one.
+        assert_eq!(cooldown_seconds(&shot.cooldown, Scope { params: &shot.params, stats: &PlayerStats::new() }), None);
+
+        // The lore uses the bow's own attack speed, even while a sword is held.
+        let formats = parse_stat_formats("f", include_str!("../../examples/formats/stats_format.kdl")).unwrap().0;
+        let sword = PlayerStats::from([("attack_speed".to_string(), 1.6), ("damage".to_string(), 12.0)]);
+        let lore = shortbow.lore_lines(&sword, &formats);
+        assert!(lore.iter().any(|l| l.contains("Left-click / Right-click")), "{lore:?}");
+        assert!(lore.iter().any(|l| l.contains("0.83s cooldown")), "{lore:?}");
+
+        // `ranged #false` turns a bow into a plain item.
+        let mut f = parse_file("i.kdl", "item \"b\" {\n  name \"B\"\n  base \"minecraft:bow\"\n  ranged #false\n}").unwrap();
+        assert!(!link(f.items.remove(0), &library(), &rarities()).unwrap().ranged);
+    }
+
+    #[test]
+    fn several_triggers() {
+        let e = err("skill \"s\" {\n  trigger \"left_click\" \"left_click\"\n  heal 1\n}");
+        assert!(e.contains("listed twice"), "{e}");
+        let e = err("skill \"s\" {\n  trigger \"left_click\"\n  trigger \"right_click\"\n  heal 1\n}");
+        assert!(e.contains("one `trigger` line"), "{e}");
+        // A victim only exists when every trigger has one.
+        let skill = &parse_file("t", "skill \"s\" {\n  trigger \"left_click\" \"hit\"\n  target \"victim\" {\n    heal 1\n  }\n}").unwrap().skills[0];
+        let problems = crate::engine::validate(skill);
+        assert!(problems.iter().any(|p| p.contains("only works in `hit` and `kill` skills")), "{problems:?}");
+    }
+
+    #[test]
     fn sneak_click_triggers() {
         let lib = library();
-        assert_eq!(lib["overcharge"].trigger, Trigger::SneakRightClick);
+        assert_eq!(lib["overcharge"].triggers, [Trigger::SneakRightClick]);
 
         // The item can set the same library skill off with another trigger.
         let both = item("item \"w\" {
@@ -2079,9 +2161,9 @@ mod tests {
   skill \"thunderstrike\"
   skill \"thunderstrike\" trigger=\"sneak-right-click\"
 }");
-        let triggers: Vec<Trigger> = both.skills.iter().map(|s| s.skill.trigger).collect();
+        let triggers: Vec<Trigger> = both.skills.iter().map(|s| s.skill.triggers[0]).collect();
         assert_eq!(triggers, [Trigger::RightClick, Trigger::SneakRightClick]);
-        assert_eq!(lib["thunderstrike"].trigger, Trigger::RightClick, "the library skill is untouched");
+        assert_eq!(lib["thunderstrike"].triggers, [Trigger::RightClick], "the library skill is untouched");
 
         // Clicks already decide sneaking, so a clashing `when` never fires.
         let mut f = parse_file("i.kdl", "item \"w\" {
@@ -2149,7 +2231,7 @@ mod tests {
         let triggers: Vec<Trigger> = parsed
             .items
             .into_iter()
-            .map(|f| link(f, &lib, &rarities()).unwrap().skills[0].skill.trigger)
+            .map(|f| link(f, &lib, &rarities()).unwrap().skills[0].skill.triggers[0])
             .collect();
         assert_eq!(
             triggers,
@@ -2165,7 +2247,7 @@ mod tests {
     target \"victim\" { damage 2 }
   }
 }");
-        assert_eq!(helm.skills[0].skill.trigger, Trigger::Hit);
+        assert_eq!(helm.skills[0].skill.triggers, [Trigger::Hit]);
 
         // Click skills are rejected on armor.
         let mut f = parse_file("i.kdl", "item \"h\" {

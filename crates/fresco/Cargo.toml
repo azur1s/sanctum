@@ -1,0 +1,16 @@
+[package]
+name = "fresco"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+pumpkin-plugin-api.workspace = true
+serde.workspace = true
+sha1 = "0.10"
+toml.workspace = true
+tracing.workspace = true
+# No compression features: PNGs are already compressed, so files are stored as is.
+zip = { version = "2", default-features = false }

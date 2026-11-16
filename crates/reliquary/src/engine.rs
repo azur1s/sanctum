@@ -13,7 +13,7 @@ use pumpkin_plugin_api::{
     wit::pumpkin::plugin::{sounds::SoundCategory, status_effect::StatusEffectInstance},
 };
 
-use crate::items::{Action, Actions, Check, Condition, ItemDef, Mechanic, Num, Params, PlayerStats, Scope, SkillDef, Targeter, Trigger, stat_key};
+use crate::items::{Action, Actions, Check, Condition, ItemDef, Mechanic, Num, Params, PlayerStats, Scope, SkillDef, Targeter, Trigger, cooldown_seconds, stat_key};
 use crate::texts::{messages, msg};
 use crate::{admin, counters, mana, names};
 
@@ -47,6 +47,12 @@ impl Cast<'_> {
     fn num(&self, n: &Num) -> f64 {
         let params = self.params.borrow();
         n.get(Scope { params: &params, stats: &self.stats })
+    }
+
+    /// Evaluates with the current params; the borrow ends with the call.
+    fn scope_num(&self, f: impl FnOnce(Scope) -> Option<f64>) -> Option<f64> {
+        let params = self.params.borrow();
+        f(Scope { params: &params, stats: &self.stats })
     }
 
     /// Runs `f` with `var` (if any) set to `i`. Anything `f` schedules keeps the value.
@@ -93,12 +99,13 @@ impl Subject {
 /// Particles that need extra data (a color, block, item, ...). Pumpkin's
 /// plugin `spawn_particle` always sends none, and the client disconnects on
 /// such a packet ("Failed to decode packet 'level_particles'"), so these are
-/// rejected on load. From vanilla's particle types; new 26.x particles are
-/// not checked.
+/// rejected on load. From the `ParticleTypes` of the 26.2 client jar (every
+/// type that is not a `SimpleParticleType`).
 const NEEDS_DATA: &[&str] = &[
     "block", "block_marker", "block_crumble", "falling_dust", "dust_pillar", "dust",
     "dust_color_transition", "effect", "instant_effect", "entity_effect", "flash",
     "tinted_leaves", "dragon_breath", "item", "vibration", "trail", "sculk_charge", "shriek",
+    "geyser", "geyser_base", "geyser_poof", "geyser_plume",
 ];
 
 /// The particle for a name, unless it is unknown or needs extra data.
@@ -199,11 +206,11 @@ pub fn try_cast(cast: &Cast, item: &ItemDef, skill_index: usize) -> bool {
         return false;
     }
     let group = cooldown_group(item, skill_index);
-    let cooldown = if admin::no_cooldown() { 0.0 } else { use_.cooldown };
+    let cooldown = if admin::no_cooldown() { 0.0 } else { cast.scope_num(|scope| cooldown_seconds(&use_.cooldown, scope)).unwrap_or(0.0) };
     if cooldown > 0.0 && cast.caster.is_on_cooldown(&group) {
-        if skill.trigger != Trigger::Hit {
+        if skill.notices() {
             // get_cooldown is the fraction left, so scale by the full duration.
-            let left = (cast.caster.get_cooldown(&group) * cooldown).ceil().max(1.0) as u32;
+            let left = (f64::from(cast.caster.get_cooldown(&group)) * cooldown).ceil().max(1.0) as u32;
             notice(&cast.caster, "cooldown", &msg(&messages::ON_COOLDOWN, &[("seconds", &left)]));
         }
         return false;
@@ -219,13 +226,14 @@ pub fn try_cast(cast: &Cast, item: &ItemDef, skill_index: usize) -> bool {
     }
     let key = cast.caster.get_id().to_string();
     if use_.mana_cost > 0 && !admin::infinite_mana() && mana::try_spend(&key, use_.mana_cost).is_none() {
-        if skill.trigger != Trigger::Hit {
+        if skill.notices() {
             notice(&cast.caster, "mana", &msg(&messages::NOT_ENOUGH_MANA, &[]));
         }
         return false;
     }
     if cooldown > 0.0 {
-        cast.caster.start_cooldown(&group, (cooldown * 20.0).round() as i32);
+        // At least a tick, or a very short cooldown would be none at all.
+        cast.caster.start_cooldown(&group, ((cooldown * 20.0).round() as i32).max(1));
     }
     run(cast, &skill.actions, 0, &me);
     true
@@ -265,6 +273,7 @@ fn run(cast: &Cast, actions: &Actions, from: usize, subject: &Subject) {
                 };
                 fly(cast, caster.get_eye_position(), shot);
             }
+            Action::Arrow { speed, arc } => crate::arrows::shoot(cast, cast.num(speed).max(0.1), cast.num(arc)),
             Action::Chain { jumps, radius, delay, beam, actions: body } => {
                 if let Subject::Entity(e) = subject {
                     let link = ChainLink {
@@ -455,7 +464,7 @@ fn find_entity(caster: &Player, id: u32) -> Option<Entity> {
 
 // ---- Targeters -------------------------------------------------------------------
 
-fn add(a: Vec3, b: Vec3) -> Vec3 {
+pub(crate) fn add(a: Vec3, b: Vec3) -> Vec3 {
     (a.0 + b.0, a.1 + b.1, a.2 + b.2)
 }
 
@@ -463,11 +472,11 @@ fn sub(a: Vec3, b: Vec3) -> Vec3 {
     (a.0 - b.0, a.1 - b.1, a.2 - b.2)
 }
 
-fn scale(a: Vec3, s: f64) -> Vec3 {
+pub(crate) fn scale(a: Vec3, s: f64) -> Vec3 {
     (a.0 * s, a.1 * s, a.2 * s)
 }
 
-fn length(v: Vec3) -> f64 {
+pub(crate) fn length(v: Vec3) -> f64 {
     (v.0 * v.0 + v.1 * v.1 + v.2 * v.2).sqrt()
 }
 
@@ -478,8 +487,14 @@ fn center(e: &Entity) -> Vec3 {
 }
 
 /// Unit vector of where an entity is looking.
-fn look(e: &Entity) -> Vec3 {
-    let (yaw, pitch) = (e.get_yaw().to_radians() as f64, e.get_pitch().to_radians() as f64);
+pub(crate) fn look(e: &Entity) -> Vec3 {
+    look_turned(e, 0.0)
+}
+
+/// Where an entity looks, turned `degrees` around the vertical (positive =
+/// right), keeping its pitch.
+pub(crate) fn look_turned(e: &Entity, degrees: f64) -> Vec3 {
+    let (yaw, pitch) = ((e.get_yaw() as f64 + degrees).to_radians(), (e.get_pitch() as f64).to_radians());
     (-yaw.sin() * pitch.cos(), -pitch.sin(), yaw.cos() * pitch.cos())
 }
 
@@ -807,10 +822,10 @@ fn validate_actions(skill: &crate::items::SkillDef, actions: &Actions, problems:
     for action in actions.iter() {
         match action {
             Action::Target { targeter, actions, .. } => {
-                if matches!(targeter, Targeter::Victim) && !matches!(skill.trigger, Trigger::Hit | Trigger::Kill) {
+                if matches!(targeter, Targeter::Victim) && !skill.triggers.iter().all(|t| matches!(t, Trigger::Hit | Trigger::Kill)) {
                     problems.push(format!("{at}: `target \"victim\"` only works in `hit` and `kill` skills"));
                 }
-                if matches!(targeter, Targeter::Attacker) && skill.trigger != Trigger::Damaged {
+                if matches!(targeter, Targeter::Attacker) && !skill.triggers.iter().all(|t| *t == Trigger::Damaged) {
                     problems.push(format!("{at}: `target \"attacker\"` only works in `damaged` skills"));
                 }
                 validate_actions(skill, actions, problems);
@@ -827,7 +842,7 @@ fn validate_actions(skill: &crate::items::SkillDef, actions: &Actions, problems:
                 }
                 validate_actions(skill, actions, problems);
             }
-            Action::Wait(_) => {}
+            Action::Wait(_) | Action::Arrow { .. } => {}
             Action::Mechanic(m) => {
                 let bad = match m {
                     Mechanic::Damage { source: Some(source), .. } if names::damage_type(source).is_none() => {

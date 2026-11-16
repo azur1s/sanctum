@@ -1,0 +1,35 @@
+// Archery skills (KDL v2).
+//
+// `arrow speed=3` shoots a real arrow from your eyes along where you look
+// (3 is a fully drawn bow). It hits for your weapon's `damage` with crits,
+// elements and the target's defense, like a melee hit, and sets off your
+// `hit` skills.
+
+skill "quick_shot" {
+    name "Quick Shot"
+    description "Loose an arrow instantly. More attack speed, faster shots."
+    // Both clicks share one cooldown, so alternating them is no faster.
+    trigger "left_click" "right_click"
+    // A formula: 1.2 attack speed is a shot every 0.83s.
+    cooldown "1 / self.attack_speed"
+    // No "on cooldown" message for every click that comes too early.
+    quiet #true
+
+    sound "entity.arrow.shoot" pitch=1.2
+    arrow speed=3
+}
+
+// `arc` turns an arrow off where you look, in degrees around you: positive to
+// the right, negative to the left (90 is straight out to your right, 180
+// behind you). A fan of three:
+skill "volley" {
+    name "Volley"
+    description "Loose three arrows in a fan."
+    trigger "right_click"
+    cooldown 4
+
+    sound "entity.arrow.shoot" pitch=0.8
+    arrow speed=2.5 arc=-12
+    arrow speed=2.5
+    arrow speed=2.5 arc=12
+}

@@ -1,0 +1,43 @@
+// Ranged relics (KDL v2).
+//
+// A ranged relic's arrows hit for its `damage` stat, with crits, elements and
+// the target's defense, like a melee hit, and set off your `hit` skills.
+// Swinging it at something does nothing.
+//
+// Items built on a bow or crossbow are ranged on their own; anything else
+// needs `ranged #true`.
+
+// A normal bow: hold right-click to draw, let go to shoot. Damage follows how
+// far you drew it, like vanilla. Needs arrows, like vanilla.
+item "hunters_longbow" {
+    name "Hunter's Longbow"
+    kind "Bow"
+    base "minecraft:bow"
+    rarity "rare"
+    lore "Draw it all the way back."
+
+    stats {
+        damage      20
+        crit-chance 15
+    }
+}
+
+// A shortbow: click to shoot at once, no drawing and no arrows needed. The
+// base is a stick, which does nothing on right-click, wearing the bow's
+// model: on a real bow the client would start drawing it on every
+// right-click.
+item "apprentice_shortbow" {
+    name "Apprentice Shortbow"
+    kind "Shortbow"
+    base "minecraft:stick"
+    model "minecraft:bow"
+    ranged #true
+    rarity "uncommon"
+
+    stats {
+        damage       10
+        attack-speed 1.2
+    }
+
+    skill "quick_shot"
+}

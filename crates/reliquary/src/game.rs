@@ -38,8 +38,9 @@ use crate::{mana, stats};
 pub(crate) const NS: &str = "reliquary";
 const PERMISSION: &str = "reliquary:command.relic";
 /// Written to `items/` and `skills/` when those folders do not exist yet.
-const EXAMPLES: [(&str, &str); 8] = [
+const EXAMPLES: [(&str, &str); 10] = [
     ("items/moonlit_edge.kdl", include_str!("../examples/items/moonlit_edge.kdl")),
+    ("items/bows.kdl", include_str!("../examples/items/bows.kdl")),
     ("items/stormcaller.kdl", include_str!("../examples/items/stormcaller.kdl")),
     ("items/starweave.kdl", include_str!("../examples/items/starweave.kdl")),
     ("items/gems.kdl", include_str!("../examples/items/gems.kdl")),
@@ -47,6 +48,7 @@ const EXAMPLES: [(&str, &str); 8] = [
     ("skills/blades.kdl", include_str!("../examples/skills/blades.kdl")),
     ("skills/storm.kdl", include_str!("../examples/skills/storm.kdl")),
     ("skills/starweave.kdl", include_str!("../examples/skills/starweave.kdl")),
+    ("skills/archery.kdl", include_str!("../examples/skills/archery.kdl")),
 ];
 
 static ITEMS: RwLock<BTreeMap<String, Arc<ItemDef>>> = RwLock::new(BTreeMap::new());
@@ -544,7 +546,7 @@ fn keep_damage(old: &ItemStack, new: &ItemStack) {
 }
 
 /// The relic in the player's main hand.
-fn held_relic(player: &Player) -> Option<Arc<ItemDef>> {
+pub(crate) fn held_relic(player: &Player) -> Option<Arc<ItemDef>> {
     relic_of(&player.get_item_in_hand(Hand::Right)?)
 }
 
@@ -671,7 +673,7 @@ fn fire_from(
     when: impl Fn(Trigger) -> bool,
     from_proc: bool,
 ) {
-    if !items.iter().any(|d| d.skills.iter().any(|s| when(s.skill.trigger))) {
+    if !items.iter().any(|d| d.skills.iter().any(|s| s.skill.triggers.iter().any(|t| when(*t)))) {
         return;
     }
     let key = player_key(&player);
@@ -680,7 +682,7 @@ fn fire_from(
     let mut used = false;
     for def in items {
         for (index, skill) in def.skills.iter().enumerate() {
-            if when(skill.skill.trigger) {
+            if skill.skill.triggers.iter().any(|t| when(*t)) {
                 cast.params.replace(skill.params.clone());
                 used |= engine::try_cast(&cast, def, index);
             }
@@ -712,7 +714,7 @@ fn fire_held(server: &Server, player: Player, other: Option<Entity>, trigger: Tr
 /// armor procs on any melee hit, bare-fisted too. They stack; each keeps its
 /// own cooldown. `from_proc`: started by `triggers-hit`, so it never causes
 /// another hit.
-fn fire_hit(server: &Server, player: Player, victim: Option<Entity>, from_proc: bool) {
+pub(crate) fn fire_hit(server: &Server, player: Player, victim: Option<Entity>, from_proc: bool) {
     let items: Vec<_> = stats::equipped(&player).into_iter().map(|s| s.item).collect();
     fire_from(server, player, victim, &items, |t| t == Trigger::Hit, from_proc);
 }
@@ -1158,6 +1160,23 @@ impl EventHandler<PlayerInteractEvent> for OnInteract {
 struct OnHit;
 impl EventHandler<EntityDamageByEntityEvent> for OnHit {
     fn handle(&self, server: Server, mut event: EventData<EntityDamageByEntityEvent>) -> EventData<EntityDamageByEntityEvent> {
+        // Arrows from ranged relics hit for the relic, not as plain arrows.
+        if crate::arrows::on_hit(&server, &mut event) {
+            return event;
+        }
+        let attacker = server
+            .get_all_players()
+            .into_iter()
+            .find(|p| p.as_entity().get_id() as i32 == event.damager_id);
+        // A bow is not a club: swinging a ranged relic at something does
+        // nothing (its left-click skill, if any, still fires).
+        if let Some(player) = &attacker
+            && crate::indicators::current_source(event.entity_id as u32).as_deref() == Some("player_attack")
+            && held_relic(player).is_some_and(|def| def.ranged)
+        {
+            event.cancelled = true;
+            return event;
+        }
         // The event only has entity ids, so find the attacker and victim by id.
         crate::triggers::note_attacker(event.entity_id as u32, event.damager_id as u32);
         // Skill damage has no attacker: it never gets here, and applies defense
@@ -1186,10 +1205,6 @@ impl EventHandler<EntityDamageByEntityEvent> for OnHit {
             let multiplier = hit_multiplier(defense.as_deref(), None, weapon.as_ref(), &stats::of_entity(&server, &target));
             event.damage = (f64::from(event.damage) * multiplier * crit) as f32;
         }
-        let attacker = server
-            .get_all_players()
-            .into_iter()
-            .find(|p| p.as_entity().get_id() as i32 == event.damager_id);
         if let Some(player) = attacker {
             crate::triggers::note_hit(event.entity_id as u32, &player);
             crate::indicators::note_player_damage(event.entity_id as u32, None);
@@ -1222,6 +1237,7 @@ impl EventHandler<PlayerLeaveEvent> for OnLeave {
         stats::forget(&event.player);
         crate::triggers::forget(&player_key(&event.player));
         crate::counters::forget(&player_key(&event.player));
+        crate::arrows::forget(&player_key(&event.player));
         save_mana();
         event
     }
@@ -1311,6 +1327,9 @@ pub fn register(context: &Context) -> Result<(), String> {
 
     context.register_event_handler::<PlayerInteractEvent, _>(OnInteract, EventPriority::Normal, true)?;
     context.register_event_handler::<EntityDamageByEntityEvent, _>(OnHit, EventPriority::Normal, true)?;
+    // Blocking: the arrow must be known before it can hit anything.
+    context.register_event_handler::<pumpkin_plugin_api::events::ProjectileLaunchEvent, _>(crate::arrows::OnLaunch, EventPriority::Normal, true)?;
+    context.register_event_handler::<pumpkin_plugin_api::events::ProjectileHitEvent, _>(crate::arrows::OnLand, EventPriority::Normal, false)?;
     context.register_event_handler::<PlayerJoinEvent, _>(OnJoin, EventPriority::Normal, false)?;
     context.register_event_handler::<PlayerLeaveEvent, _>(OnLeave, EventPriority::Normal, false)?;
     context.register_event_handler::<InventoryClickEvent, _>(crate::menu::OnClick, EventPriority::Normal, true)?;

@@ -48,6 +48,10 @@ pub struct ItemDef {
     pub gem: Option<String>,
     /// `reforgeable #false` keeps reforges off this item.
     pub reforgeable: bool,
+    /// A bow or other ranged weapon: its melee hits do nothing, and its
+    /// arrows (drawn or from an `arrow` skill) deal its `damage` instead.
+    /// `ranged #true`, or any item built on a bow or crossbow.
+    pub ranged: bool,
     /// `unbreakable #true` stops the item losing durability.
     pub unbreakable: bool,
     /// `unbreakable #true hidden=#true` leaves out the client's "Unbreakable" line.
@@ -344,8 +348,8 @@ pub struct ItemSkill {
     pub skill: Arc<SkillDef>,
     pub name: String,
     pub mana_cost: u32,
-    /// Seconds.
-    pub cooldown: f32,
+    /// Seconds; may be a formula like `"1 / self.attack_speed"`.
+    pub cooldown: Num,
     /// 0.0..=1.0
     pub chance: f64,
     /// Defaults from the skill, with the item's overrides on top.
@@ -438,11 +442,16 @@ pub struct SkillDef {
     /// Shown in lore.
     pub name: String,
     pub description: Vec<String>,
-    pub trigger: Trigger,
+    /// Any of these sets it off. One skill, so one cooldown, whichever fired.
+    pub triggers: Vec<Trigger>,
     /// Defaults; items may override them.
     pub chance: f64,
     pub mana_cost: u32,
-    pub cooldown: f32,
+    /// Seconds; may be a formula.
+    pub cooldown: Num,
+    /// `quiet #true`: no "on cooldown" / "not enough mana" notices, for skills
+    /// meant to be clicked fast, like a shortbow shot.
+    pub quiet: bool,
     pub params: Params,
     /// Checked against the caster before anything runs.
     pub conditions: Vec<Condition>,
@@ -452,6 +461,14 @@ pub struct SkillDef {
     pub on_fail: Actions,
     /// `counter "rage" ...`, read in formulas as `$rage`.
     pub counters: Vec<CounterDef>,
+}
+
+impl SkillDef {
+    /// Whether a denied cast tells the player why. Hit procs never do: they
+    /// would spam on every swing.
+    pub fn notices(&self) -> bool {
+        !self.quiet && !self.triggers.iter().all(|t| *t == Trigger::Hit)
+    }
 }
 
 /// `counter "rage" max=8 expire="5s" decay="all"`: a number kept between
@@ -500,6 +517,12 @@ pub enum Action {
     /// blocks per tick. `trail` runs on each point it passes, `hit` on the
     /// first entity it touches, `end` where it stops without hitting one.
     Projectile { speed: Num, range: Num, radius: Num, trail: Actions, hit: Actions, end: Actions },
+    /// A real arrow from the caster's eyes along where it looks, `speed`
+    /// blocks per tick (a fully drawn bow is 3). It hits for the caster's
+    /// weapon `damage`, like a drawn bow, and sets off their `hit` skills.
+    /// `arc` turns it that many degrees off where the caster looks, around
+    /// the vertical: positive to the right, negative to the left.
+    Arrow { speed: Num, arc: Num },
     /// Runs `actions` on the subject, then on the nearest new entity within
     /// `radius`, `jumps` times in total, `delay` ticks apart.
     Chain { jumps: Num, radius: Num, delay: Num, beam: Option<String>, actions: Actions },
@@ -790,7 +813,7 @@ pub struct SkillUse {
     pub skill: SkillSource,
     pub name: Option<String>,
     pub mana_cost: Option<u32>,
-    pub cooldown: Option<f32>,
+    pub cooldown: Option<Num>,
     pub chance: Option<f64>,
     /// `trigger="..."`: sets the skill off with this instead of its own trigger.
     pub trigger: Option<Trigger>,
@@ -871,28 +894,32 @@ pub fn link(
             },
         };
         let skill = match u.trigger {
-            Some(trigger) if trigger != skill.trigger => Arc::new(SkillDef { trigger, ..(*skill).clone() }),
+            Some(trigger) if skill.triggers != [trigger] => Arc::new(SkillDef { triggers: vec![trigger], ..(*skill).clone() }),
             _ => skill,
         };
-        if let Some(sneaking) = skill.trigger.decided_sneaking()
-            && skill.conditions.iter().any(|c| matches!(c.check, Check::Sneaking) && c.negate == sneaking)
-        {
+        let never = skill.triggers.iter().copied().find_map(|t| {
+            let sneaking = t.decided_sneaking()?;
+            skill.conditions.iter().any(|c| matches!(c.check, Check::Sneaking) && c.negate == sneaking).then_some((t, sneaking))
+        });
+        if let Some((trigger, sneaking)) = never {
             let fix = if sneaking { "sneak_" } else { "" };
             problems.push(format!(
                 "{}: skill `{}` triggers on {} but has `when \"{}sneaking\"`, so it can never fire (use trigger \"{fix}right_click\" / \"{fix}left_click\" and drop the `when`)",
                 u.at,
                 skill.id,
-                skill.trigger.label().to_lowercase(),
+                trigger.label().to_lowercase(),
                 if sneaking { "!" } else { "" },
             ));
             continue;
         }
-        if item.slot != Slot::MainHand && skill.trigger.main_hand_only() {
+        if let Some(trigger) = skill.triggers.iter().find(|t| t.main_hand_only())
+            && item.slot != Slot::MainHand
+        {
             problems.push(format!(
                 "{}: skill `{}` triggers on {}, which only works for main-hand items (this item goes in {:?})",
                 u.at,
                 skill.id,
-                skill.trigger.label().to_lowercase(),
+                trigger.label().to_lowercase(),
                 item.slot
             ));
             continue;
@@ -910,7 +937,7 @@ pub fn link(
         item.skills.push(ItemSkill {
             name: u.name.unwrap_or_else(|| skill.name.clone()),
             mana_cost: u.mana_cost.unwrap_or(skill.mana_cost),
-            cooldown: u.cooldown.unwrap_or(skill.cooldown),
+            cooldown: u.cooldown.unwrap_or_else(|| skill.cooldown.clone()),
             chance: u.chance.unwrap_or(skill.chance),
             params: Arc::new(params),
             skill,
@@ -1025,6 +1052,14 @@ impl Line<'_> {
     }
 }
 
+/// A cooldown in seconds, if there is one. A formula that comes out
+/// negative, zero, infinite or NaN (like `1 / self.attack_speed` with no
+/// attack speed) means no cooldown.
+pub fn cooldown_seconds(cooldown: &Num, scope: Scope) -> Option<f64> {
+    let seconds = cooldown.get(scope);
+    (seconds.is_finite() && seconds > 0.0).then_some(seconds)
+}
+
 /// Cooldown group for one skill of one item. Shared by every copy of the item,
 /// and for a gem's skills by every copy of the gem.
 pub fn cooldown_group(item: &ItemDef, skill_index: usize) -> String {
@@ -1035,6 +1070,22 @@ pub fn cooldown_group(item: &ItemDef, skill_index: usize) -> String {
 }
 
 impl ItemDef {
+    /// `stats` as they would be with this item in the main hand: only one
+    /// main-hand item counts, so its main-hand-only stats (damage, attack
+    /// speed) replace whatever is held now. Lets a skill's lore show
+    /// `1 / self.attack_speed` for this bow even while a sword is held.
+    pub fn as_held(&self, stats: &PlayerStats) -> PlayerStats {
+        if self.slot != Slot::MainHand {
+            return stats.clone();
+        }
+        let main_hand_only = |key: &str| stat_info(split_stat(key).0).is_some_and(|i| i.main_hand_only);
+        let mut held: PlayerStats = stats.iter().filter(|(k, _)| !main_hand_only(k)).map(|(k, v)| (k.clone(), *v)).collect();
+        for (stat, value) in self.stats.iter().filter(|(k, _)| main_hand_only(k)) {
+            held.insert(stat.clone(), *value);
+        }
+        held
+    }
+
     /// Gems and upgrade items do nothing on their own: they go into other items.
     pub fn is_relic(&self) -> bool {
         self.gem.is_none() && self.upgrade.is_none()
@@ -1113,12 +1164,14 @@ impl ItemDef {
         let texts = &formats.lore;
         let c = &self.rarity.color;
         let mut lines = Vec::new();
+        let stats = &self.as_held(stats);
         for skill in &self.skills {
             let scope = Scope { params: &skill.params, stats };
             if !lines.is_empty() {
                 lines.push(String::new());
             }
-            let trigger = formats.trigger_label(skill.skill.trigger);
+            let labels: Vec<String> = skill.skill.triggers.iter().map(|t| formats.trigger_label(*t)).collect();
+            let trigger = labels.join(" / ");
             lines.push(texts.fill(&lore::SKILL_HEADER, &[("color", c), ("name", &skill.name), ("trigger", &trigger)]));
             for l in &skill.skill.description {
                 let text = expr::render(&format!("{}{l}", texts.get(&lore::SKILL_DESCRIPTION_STYLE)), scope);
@@ -1129,8 +1182,10 @@ impl ItemDef {
             if skill.mana_cost > 0 {
                 costs.push(texts.fill(&lore::COST_MANA, &[("amount", &skill.mana_cost)]));
             }
-            if skill.cooldown > 0.0 {
-                costs.push(texts.fill(&lore::COST_COOLDOWN, &[("seconds", &skill.cooldown)]));
+            if let Some(seconds) = cooldown_seconds(&skill.cooldown, scope) {
+                // Formulas give long decimals: two places is plenty.
+                let seconds = (seconds * 100.0).round() / 100.0;
+                costs.push(texts.fill(&lore::COST_COOLDOWN, &[("seconds", &seconds)]));
             }
             if skill.chance < 1.0 {
                 costs.push(texts.fill(&lore::COST_CHANCE, &[("percent", &(skill.chance * 100.0).round())]));

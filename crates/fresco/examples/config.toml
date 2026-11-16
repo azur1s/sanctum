@@ -1,0 +1,49 @@
+# Fresco: drop a PNG into textures/, get an item model id.
+#
+#   textures/flame_sword.png          ->  sanctum:flame_sword
+#   textures/weapons/flame_sword.png  ->  sanctum:weapons/flame_sword
+#
+# File names: lowercase a-z, 0-9, _ - . only.
+# Optional next to a texture:
+#   flame_sword.png.mcmeta   animation, copied as is
+#   flame_sword.json         your own model file, used instead of the generated
+#                            one (3D models go here; it refers to textures as
+#                            "<namespace>:item/<path>")
+# /fresco lists the ids, /fresco reload rebuilds. models.txt has the list too.
+
+# Namespace of every id.
+namespace = "sanctum"
+
+# Path prefixes held like tools (sword/pickaxe pose) instead of flat items.
+# Example: handheld = ["weapons/", "tools/wand"]
+handheld = []
+
+# Rebuild on its own when textures/ or this file changes.
+watch = true
+
+# Shown in the client's resource pack list.
+description = "Server textures"
+
+# Resource pack formats the pack claims to support, lowest and highest.
+# Only changes whether the client calls the pack "made for another version".
+formats = [65, 999]
+
+# Kick players who decline the pack.
+force = false
+
+# Text on the client's "accept this pack?" screen. Empty for none.
+prompt = ""
+
+[serve]
+# Serve pack.zip over HTTP from the plugin and send it to players on join.
+# Off: the plugin only writes pack.zip and pack.sha1, and you host it yourself
+# ([resource_pack.java] in pumpkin.toml).
+enabled = true
+
+# The port must be reachable by players, like the game port.
+port = 8163
+
+# Where players download from. Empty: the address they joined with, on `port`.
+# Set it when the pack lives elsewhere or players come through a proxy, e.g.
+# url = "https://cdn.example.com/pack.zip"
+url = ""
